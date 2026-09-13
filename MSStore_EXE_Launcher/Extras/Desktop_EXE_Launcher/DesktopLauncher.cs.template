@@ -1,0 +1,87 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Windows.Forms;
+
+internal static class DesktopLauncher
+{
+    private const string TargetPath = __TARGET_PATH__;
+    private const string FixedArguments = __ARGUMENTS__;
+    private const string ProcessName = __PROCESS_NAME__;
+    private const string WindowClass = __WINDOW_CLASS__;
+    private const string WindowTitle = __WINDOW_TITLE__;
+    private const bool IncludeHidden = __INCLUDE_HIDDEN__;
+    private delegate bool EnumWindowsCallback(IntPtr window, IntPtr parameter);
+
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder text, int count);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr window, int command);
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint attachTo, bool value);
+
+    private static string Json(string value) { return "\"" + (value ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""; }
+
+    private static bool Matches(IntPtr window)
+    {
+        if (!IncludeHidden && !IsWindowVisible(window)) return false;
+        uint processId;
+        GetWindowThreadProcessId(window, out processId);
+        try { if (!String.Equals(Process.GetProcessById((int)processId).ProcessName, ProcessName, StringComparison.OrdinalIgnoreCase)) return false; }
+        catch { return false; }
+        StringBuilder className = new StringBuilder(256);
+        GetClassName(window, className, className.Capacity);
+        if (WindowClass.Length > 0 && !String.Equals(className.ToString(), WindowClass, StringComparison.OrdinalIgnoreCase)) return false;
+        StringBuilder title = new StringBuilder(1024);
+        GetWindowText(window, title, title.Capacity);
+        return WindowTitle.Length == 0 || title.ToString().IndexOf(WindowTitle, StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    private static IntPtr FindWindow()
+    {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr window, IntPtr parameter) { if (Matches(window)) { found = window; return false; } return true; }, IntPtr.Zero);
+        return found;
+    }
+
+    private static bool Activate(IntPtr window)
+    {
+        if (window == IntPtr.Zero) return false;
+        if (IsIconic(window)) ShowWindowAsync(window, 9); else ShowWindowAsync(window, 5);
+        IntPtr foreground = GetForegroundWindow();
+        uint ignored;
+        uint foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out ignored);
+        uint currentThread = GetCurrentThreadId();
+        bool attached = foregroundThread != 0 && foregroundThread != currentThread && AttachThreadInput(currentThread, foregroundThread, true);
+        try { BringWindowToTop(window); return SetForegroundWindow(window); }
+        finally { if (attached) AttachThreadInput(currentThread, foregroundThread, false); }
+    }
+
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        string expandedTarget = Environment.ExpandEnvironmentVariables(TargetPath);
+        if (args.Length == 1 && String.Equals(args[0], "--print-config", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("{\"targetPath\":" + Json(expandedTarget) + ",\"arguments\":" + Json(FixedArguments) + ",\"processName\":" + Json(ProcessName) + ",\"windowClass\":" + Json(WindowClass) + ",\"windowTitle\":" + Json(WindowTitle) + ",\"includeHidden\":" + (IncludeHidden ? "true" : "false") + "}");
+            return 0;
+        }
+        IntPtr existing = FindWindow();
+        if (existing != IntPtr.Zero) return Activate(existing) ? 0 : 3;
+        if (!File.Exists(expandedTarget)) { MessageBox.Show("Executable not found:\r\n" + expandedTarget, "Desktop EXE Launcher", MessageBoxButtons.OK, MessageBoxIcon.Error); return 2; }
+        try
+        {
+            Process.Start(new ProcessStartInfo { FileName=expandedTarget, Arguments=FixedArguments, WorkingDirectory=Path.GetDirectoryName(expandedTarget), UseShellExecute=false });
+            return 0;
+        }
+        catch (Exception exception) { MessageBox.Show("Failed to launch application:\r\n" + exception.Message, "Desktop EXE Launcher", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1; }
+    }
+}

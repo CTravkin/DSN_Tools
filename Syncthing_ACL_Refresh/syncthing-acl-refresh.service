@@ -1,0 +1,19 @@
+[Unit]
+Description=Reconcile ACLs with Syncthing folder policy
+After=local-fs.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/syncthing-acl-refresh/syncthing-acl-refresh.env
+ExecStart=/usr/local/sbin/syncthing-acl-refresh
+Restart=on-failure
+RestartSec=10s
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+KillMode=mixed
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,115 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Automation;
+using System.Windows.Forms;
+
+internal static class TrayLauncher
+{
+    private const string TargetPath = __TARGET_PATH__;
+    private const string FixedArguments = __ARGUMENTS__;
+    private const string ProcessName = __PROCESS_NAME__;
+    private const string WindowClass = __WINDOW_CLASS__;
+    private const string WindowTitle = __WINDOW_TITLE__;
+    private const string TrayIconName = __TRAY_ICON_NAME__;
+    private const string TrayMenuItemName = __TRAY_MENU_ITEM_NAME__;
+    private const int RetryCount = __RETRY_COUNT__;
+    private const int RetryDelayMilliseconds = __RETRY_DELAY__;
+    private delegate bool EnumWindowsCallback(IntPtr window, IntPtr parameter);
+
+    [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsCallback callback, IntPtr parameter);
+    [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetWindowText(IntPtr window, StringBuilder text, int count);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern int GetClassName(IntPtr window, StringBuilder text, int count);
+    [DllImport("user32.dll")] private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool IsIconic(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr window, int command);
+    [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] private static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+
+    private static string Json(string value) { return "\"" + (value ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""; }
+
+    private static bool Matches(IntPtr window)
+    {
+        uint processId; GetWindowThreadProcessId(window, out processId);
+        try { if (!String.Equals(Process.GetProcessById((int)processId).ProcessName, ProcessName, StringComparison.OrdinalIgnoreCase)) return false; } catch { return false; }
+        StringBuilder className = new StringBuilder(256); GetClassName(window, className, className.Capacity);
+        if (WindowClass.Length > 0 && !String.Equals(className.ToString(), WindowClass, StringComparison.OrdinalIgnoreCase)) return false;
+        StringBuilder title = new StringBuilder(1024); GetWindowText(window, title, title.Capacity);
+        return title.Length > 0 && (WindowTitle.Length == 0 || title.ToString().IndexOf(WindowTitle, StringComparison.OrdinalIgnoreCase) >= 0);
+    }
+
+    private static IntPtr FindWindow()
+    {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr window, IntPtr parameter) { if (Matches(window)) { found=window; return false; } return true; }, IntPtr.Zero);
+        return found;
+    }
+
+    private static bool Activate(IntPtr window)
+    {
+        if (window == IntPtr.Zero) return false;
+        ShowWindowAsync(window, IsIconic(window) ? 9 : 5); BringWindowToTop(window); return SetForegroundWindow(window);
+    }
+
+    private static AutomationElement FindElement(ControlType type, string name)
+    {
+        Condition condition = new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty, type), new PropertyCondition(AutomationElement.NameProperty, name));
+        return AutomationElement.RootElement.FindFirst(TreeScope.Descendants, condition);
+    }
+
+    private static AutomationElement FindTrayIcon() { return FindElement(ControlType.Button, TrayIconName); }
+
+    private static bool OpenFromTray()
+    {
+        for (int attempt=0; attempt<RetryCount; attempt++)
+        {
+            AutomationElement icon = FindTrayIcon();
+            if (icon != null)
+            {
+                System.Windows.Point point;
+                if (icon.TryGetClickablePoint(out point) && SetCursorPos((int)point.X, (int)point.Y))
+                {
+                    mouse_event(0x0008,0,0,0,UIntPtr.Zero); mouse_event(0x0010,0,0,0,UIntPtr.Zero);
+                    Thread.Sleep(RetryDelayMilliseconds);
+                    AutomationElement item = FindElement(ControlType.MenuItem, TrayMenuItemName);
+                    if (item != null && item.Current.IsEnabled)
+                    {
+                        object pattern;
+                        if (item.TryGetCurrentPattern(InvokePattern.Pattern, out pattern))
+                        {
+                            ((InvokePattern)pattern).Invoke();
+                            for (int wait=0; wait<RetryCount; wait++) { Thread.Sleep(RetryDelayMilliseconds); IntPtr window=FindWindow(); if (window!=IntPtr.Zero) return Activate(window); }
+                        }
+                    }
+                }
+            }
+            Thread.Sleep(RetryDelayMilliseconds);
+        }
+        return false;
+    }
+
+    private static string DetermineAction(bool hasWindow, bool hasTrayIcon) { return hasWindow ? "activate" : (hasTrayIcon ? "open-tray" : "launch"); }
+
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        string expandedTarget = Environment.ExpandEnvironmentVariables(TargetPath);
+        if (args.Length==1 && String.Equals(args[0],"--print-config",StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("{\"targetPath\":"+Json(expandedTarget)+",\"arguments\":"+Json(FixedArguments)+",\"processName\":"+Json(ProcessName)+",\"windowClass\":"+Json(WindowClass)+",\"windowTitle\":"+Json(WindowTitle)+",\"trayIconName\":"+Json(TrayIconName)+",\"trayMenuItemName\":"+Json(TrayMenuItemName)+",\"retryCount\":"+RetryCount+",\"retryDelayMilliseconds\":"+RetryDelayMilliseconds+"}"); return 0;
+        }
+        IntPtr window = FindWindow();
+        string action = DetermineAction(window!=IntPtr.Zero, FindTrayIcon()!=null);
+        if (action=="activate") return Activate(window) ? 0 : 3;
+        if (action=="open-tray") return OpenFromTray() ? 0 : 4;
+        if (!File.Exists(expandedTarget)) { MessageBox.Show("Executable not found:\r\n"+expandedTarget,"Tray App Launcher",MessageBoxButtons.OK,MessageBoxIcon.Error); return 2; }
+        try { Process.Start(new ProcessStartInfo { FileName=expandedTarget, Arguments=FixedArguments, WorkingDirectory=Path.GetDirectoryName(expandedTarget), UseShellExecute=false }); return 0; }
+        catch(Exception exception) { MessageBox.Show("Failed to launch application:\r\n"+exception.Message,"Tray App Launcher",MessageBoxButtons.OK,MessageBoxIcon.Error); return 1; }
+    }
+}

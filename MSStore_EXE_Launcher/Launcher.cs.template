@@ -1,0 +1,33 @@
+using System;
+using System.Diagnostics;
+using System.Windows.Forms;
+
+internal static class Launcher
+{
+    private const string AppId = __APP_ID__;
+
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        if (args.Length == 1 && String.Equals(args[0], "--print-aumid", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine(AppId);
+            return 0;
+        }
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "explorer.exe",
+                Arguments = "shell:AppsFolder\\" + AppId,
+                UseShellExecute = true
+            });
+            return 0;
+        }
+        catch (Exception exception)
+        {
+            MessageBox.Show("Failed to launch the packaged application:\r\n" + exception.Message, "MS Store EXE Launcher", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return 1;
+        }
+    }
+}

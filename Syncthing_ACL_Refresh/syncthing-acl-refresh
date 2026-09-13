@@ -1,0 +1,1376 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import hmac
+import http.client
+import ipaddress
+import json
+import os
+import pwd
+import re
+import selectors
+import signal
+import sqlite3
+import ssl
+import stat
+import subprocess
+import sys
+import time
+import urllib.parse
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from pathlib import Path
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
+
+
+SYNCTHING_USER = "syncthing"
+ACL_USERS: tuple[str, ...] = ()
+FULL_REFRESH_HOURS = 3
+MISSING_FOLDER_RECHECK_SECONDS = 60
+STATE_PATH = Path("/var/lib/syncthing-acl-refresh/state.sqlite3")
+PINNED_CERTIFICATE_PATH = Path("/etc/syncthing-acl-refresh/https-cert.pem")
+CONFIG_PATH: Path | None = None
+INOTIFY_EVENTS = (
+    "attrib", "create", "moved_to", "close_write", "delete", "delete_self", "move_self"
+)
+PERMISSION_BITS = {"r": 4, "w": 2, "x": 1}
+
+
+@dataclass(frozen=True)
+class RuntimeSettings:
+    syncthing_user: str
+    acl_users: tuple[str, ...]
+    config_path: Path | None
+    state_path: Path
+    certificate_path: Path
+    refresh_hours: int
+    missing_recheck_seconds: int
+    scan: bool
+    force: bool
+
+
+def _absolute_path(value: str, variable: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ValueError(f"{variable} must be an absolute path")
+    return path
+
+
+def _managed_users(value: str) -> tuple[str, ...]:
+    users: list[str] = []
+    for item in value.split(","):
+        user = item.strip()
+        if not user:
+            continue
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*\$?", user):
+            raise ValueError(f"Invalid managed ACL user: {user}")
+        if user not in users:
+            users.append(user)
+    if not users:
+        raise ValueError("At least one managed ACL user is required")
+    return tuple(users)
+
+
+def parse_runtime_settings(
+    arguments: Sequence[str] | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> RuntimeSettings:
+    env = os.environ if environment is None else environment
+    parser = argparse.ArgumentParser(description="Reconcile POSIX ACLs with Syncthing folder policy")
+    parser.add_argument("--syncthing-user", default=env.get("SYNCTHING_USER", "syncthing"))
+    parser.add_argument("--users", default=env.get("ACL_USERS", ""))
+    parser.add_argument("--config", default=env.get("SYNCTHING_CONFIG", ""))
+    parser.add_argument("--state", default=env.get("STATE_PATH", "/var/lib/syncthing-acl-refresh/state.sqlite3"))
+    parser.add_argument("--certificate", default=env.get("TLS_CERTIFICATE", "/etc/syncthing-acl-refresh/https-cert.pem"))
+    parser.add_argument("--refresh-hours", type=int, default=env.get("REFRESH_HOURS", "3"))
+    parser.add_argument("--missing-recheck-seconds", type=int, default=env.get("MISSING_RECHECK_SECONDS", "60"))
+    parser.add_argument("--scan", action="store_true", help="run one reconciliation and exit")
+    parser.add_argument("--force", action="store_true", help="inspect ACLs even when cached metadata is unchanged")
+    parsed = parser.parse_args(arguments)
+
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*\$?", parsed.syncthing_user):
+        raise ValueError("Invalid Syncthing service user")
+    if not 1 <= parsed.refresh_hours <= 24 or 24 % parsed.refresh_hours:
+        raise ValueError("refresh-hours must be a positive divisor of 24")
+    if not 1 <= parsed.missing_recheck_seconds <= 3600:
+        raise ValueError("missing-recheck-seconds must be between 1 and 3600")
+    return RuntimeSettings(
+        syncthing_user=parsed.syncthing_user,
+        acl_users=_managed_users(parsed.users),
+        config_path=_absolute_path(parsed.config, "config") if parsed.config else None,
+        state_path=_absolute_path(parsed.state, "state"),
+        certificate_path=_absolute_path(parsed.certificate, "certificate"),
+        refresh_hours=parsed.refresh_hours,
+        missing_recheck_seconds=parsed.missing_recheck_seconds,
+        scan=parsed.scan,
+        force=parsed.force,
+    )
+
+
+def apply_runtime_settings(settings: RuntimeSettings) -> None:
+    global SYNCTHING_USER, ACL_USERS, CONFIG_PATH, STATE_PATH
+    global PINNED_CERTIFICATE_PATH, FULL_REFRESH_HOURS, MISSING_FOLDER_RECHECK_SECONDS
+    SYNCTHING_USER = settings.syncthing_user
+    ACL_USERS = settings.acl_users
+    CONFIG_PATH = settings.config_path
+    STATE_PATH = settings.state_path
+    PINNED_CERTIFICATE_PATH = settings.certificate_path
+    FULL_REFRESH_HOURS = settings.refresh_hours
+    MISSING_FOLDER_RECHECK_SECONDS = settings.missing_recheck_seconds
+
+
+class StopRequested(Exception):
+    pass
+
+
+class UnsafePathError(Exception):
+    pass
+
+
+class AclOutcome(Enum):
+    UNCHANGED = auto()
+    CHANGED = auto()
+    FAILED = auto()
+    GONE = auto()
+
+
+def log(message: str) -> None:
+    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"{timestamp} {message}", flush=True)
+
+
+def syncthing_home() -> Path:
+    return Path(pwd.getpwnam(SYNCTHING_USER).pw_dir)
+
+
+def locate_config(home: Path) -> Path:
+    if CONFIG_PATH is not None:
+        if not CONFIG_PATH.is_file():
+            raise FileNotFoundError(f"Configured Syncthing config.xml was not found: {CONFIG_PATH}")
+        return CONFIG_PATH.resolve()
+    for candidate in (home / ".local/state/syncthing/config.xml", home / ".config/syncthing/config.xml"):
+        if candidate.is_file():
+            return candidate.resolve()
+    raise FileNotFoundError(f"Syncthing config.xml was not found under {home}")
+
+
+def local_name(element: ET.Element) -> str:
+    return element.tag.rsplit("}", 1)[-1]
+
+
+def resolve_folder_path(raw_path: str, home: Path) -> Path:
+    if raw_path == "~":
+        path = home
+    elif raw_path.startswith("~/"):
+        path = home / raw_path[2:]
+    elif raw_path.startswith("~"):
+        user_part, separator, remainder = raw_path[1:].partition("/")
+        user_home = Path(pwd.getpwnam(user_part).pw_dir)
+        path = user_home / remainder if separator else user_home
+    else:
+        path = Path(raw_path)
+        if not path.is_absolute():
+            path = home / path
+    return Path(os.path.abspath(path))
+
+
+@dataclass(frozen=True)
+class GuiConfiguration:
+    url: str
+    api_key: str
+    certificate_path: Path
+
+
+@dataclass(frozen=True)
+class FolderConfiguration:
+    folder_id: str
+    path: Path
+
+
+def normalize_gui_https(address: str, use_tls: bool) -> str:
+    if not use_tls:
+        raise ValueError("Syncthing GUI must enforce HTTPS for the root helper")
+    value = address.strip()
+    parsed = urllib.parse.urlsplit(value if "://" in value else f"//{value}")
+    if parsed.scheme and parsed.scheme != "https":
+        raise ValueError("Syncthing GUI must use HTTPS")
+    host = parsed.hostname
+    try:
+        address = ipaddress.ip_address(host or "")
+    except ValueError as error:
+        raise ValueError("Syncthing GUI host must be a loopback IP literal") from error
+    if not address.is_loopback:
+        raise ValueError("Syncthing GUI must listen on loopback")
+    port = parsed.port or 8384
+    return f"https://{'[' + host + ']' if ':' in host else host}:{port}"
+
+
+def read_configuration(config_path: Path, home: Path) -> tuple[GuiConfiguration, list[FolderConfiguration]]:
+    root = ET.parse(config_path).getroot()
+    gui_element: ET.Element | None = None
+    folders: dict[str, FolderConfiguration] = {}
+    for element in root.iter():
+        name = local_name(element)
+        if name == "gui" and gui_element is None:
+            gui_element = element
+        elif name == "folder":
+            folder_id = element.attrib.get("id", "").strip()
+            raw_path = element.attrib.get("path", "").strip()
+            if folder_id and raw_path:
+                folders[folder_id] = FolderConfiguration(folder_id, resolve_folder_path(raw_path, home))
+    if gui_element is None:
+        raise ValueError("Syncthing GUI configuration is missing")
+    children = {local_name(child): (child.text or "").strip() for child in gui_element}
+    api_key = children.get("apikey", "")
+    if not api_key:
+        raise ValueError("Syncthing API key is missing")
+    gui = GuiConfiguration(
+        normalize_gui_https(
+            children.get("address", "127.0.0.1:8384"),
+            gui_element.attrib.get("tls", "false").lower() == "true",
+        ),
+        api_key,
+        PINNED_CERTIFICATE_PATH,
+    )
+    return gui, sorted(folders.values(), key=lambda item: (len(item.path.parts), os.fspath(item.path)))
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host: str, port: int, certificate_path: Path, timeout: float) -> None:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        super().__init__(host, port, timeout=timeout, context=context)
+        self.certificate_path = certificate_path
+
+    def connect(self) -> None:
+        super().connect()
+        assert isinstance(self.sock, ssl.SSLSocket)
+        peer = self.sock.getpeercert(binary_form=True)
+        pinned = ssl.PEM_cert_to_DER_cert(self.certificate_path.read_text(encoding="ascii"))
+        if not hmac.compare_digest(hashlib.sha256(peer).digest(), hashlib.sha256(pinned).digest()):
+            self.close()
+            raise ssl.SSLError("Syncthing HTTPS certificate does not match the pinned certificate")
+
+
+def api_json(gui: GuiConfiguration, endpoint: str, parameters: dict[str, str]) -> object:
+    parsed = urllib.parse.urlsplit(gui.url)
+    if parsed.scheme != "https" or parsed.hostname is None:
+        raise ValueError("Only pinned HTTPS Syncthing API connections are supported")
+    connection = PinnedHTTPSConnection(
+        parsed.hostname, parsed.port or 443, gui.certificate_path, timeout=15
+    )
+    target = endpoint + (("?" + urllib.parse.urlencode(parameters)) if parameters else "")
+    try:
+        connection.request("GET", target, headers={"X-API-Key": gui.api_key, "Accept": "application/json"})
+        response = connection.getresponse()
+        if response.status != 200:
+            raise OSError(f"Syncthing API returned HTTP {response.status}")
+        return json.load(response)
+    finally:
+        connection.close()
+
+
+def strip_pattern_prefixes(pattern: str) -> tuple[str, bool, bool]:
+    case_insensitive = False
+    negated = False
+    while True:
+        if pattern.startswith("(?i)"):
+            case_insensitive, pattern = True, pattern[4:]
+        elif pattern.startswith("(?d)"):
+            pattern = pattern[4:]
+        elif pattern.startswith("!"):
+            negated, pattern = not negated, pattern[1:]
+        else:
+            return pattern, case_insensitive, negated
+
+
+def split_brace_alternatives(value: str) -> list[str] | None:
+    depth = 0
+    escaped = False
+    start = -1
+    for index, character in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if character == "\\":
+            escaped = True
+        elif character == "{" and depth == 0:
+            start, depth = index, 1
+        elif character == "{" and depth:
+            depth += 1
+        elif character == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                inside = value[start + 1:index]
+                alternatives: list[str] = []
+                part_start = inner_depth = 0
+                inner_escaped = False
+                for inner_index, inner_character in enumerate(inside):
+                    if inner_escaped:
+                        inner_escaped = False
+                    elif inner_character == "\\":
+                        inner_escaped = True
+                    elif inner_character == "{":
+                        inner_depth += 1
+                    elif inner_character == "}":
+                        inner_depth -= 1
+                    elif inner_character == "," and inner_depth == 0:
+                        alternatives.append(inside[part_start:inner_index])
+                        part_start = inner_index + 1
+                alternatives.append(inside[part_start:])
+                if len(alternatives) == 1:
+                    return None
+                return [value[:start] + item + value[index + 1:] for item in alternatives]
+    return None
+
+
+def expand_braces(pattern: str) -> list[str]:
+    alternatives = split_brace_alternatives(pattern)
+    if alternatives is None:
+        return [pattern]
+    result: list[str] = []
+    for alternative in alternatives:
+        result.extend(expand_braces(alternative))
+    return result
+
+
+def glob_to_regex(pattern: str) -> str:
+    result: list[str] = []
+    index = 0
+    while index < len(pattern):
+        character = pattern[index]
+        if character == "\\":
+            index += 1
+            result.append(re.escape(pattern[index]) if index < len(pattern) else re.escape("\\"))
+        elif character == "*":
+            if index + 1 < len(pattern) and pattern[index + 1] == "*":
+                index += 1
+                if index + 1 < len(pattern) and pattern[index + 1] == "/":
+                    index += 1
+                    result.append("(?:.*/)?")
+                else:
+                    result.append(".*")
+            else:
+                result.append("[^/]*")
+        elif character == "?":
+            result.append("[^/]")
+        elif character == "[":
+            end = index + 1
+            if end < len(pattern) and pattern[end] in "!^":
+                end += 1
+            if end < len(pattern) and pattern[end] == "]":
+                end += 1
+            while end < len(pattern) and pattern[end] != "]":
+                end += 1
+            if end >= len(pattern):
+                result.append("\\[")
+            else:
+                content = pattern[index + 1:end]
+                if content.startswith("!"):
+                    content = "^" + content[1:]
+                result.append("[" + content.replace("\\", "\\\\") + "]")
+                index = end
+        else:
+            result.append(re.escape(character))
+        index += 1
+    return "".join(result)
+
+
+@dataclass(frozen=True)
+class CompiledIgnorePattern:
+    regex: re.Pattern[str]
+    negated: bool
+
+
+@dataclass(frozen=True)
+class TraversalRule:
+    pattern_index: int
+    prefix: str | None
+    subtree: bool
+    case_insensitive: bool
+
+
+def literal_prefix(pattern: str) -> tuple[str, bool]:
+    components: list[str] = []
+    subtree = False
+    for component in pattern.lstrip("/").split("/"):
+        if not component:
+            continue
+        if any(character in component for character in "*?[]{}\\"):
+            subtree = component == "**" and bool(components)
+            break
+        components.append(component)
+    return "/".join(components), subtree
+
+
+def discover_control_paths(root: Path) -> set[str]:
+    root = root.resolve()
+    result = {".stignore", ".stfolder"}
+    first = root / ".stignore"
+    if not first.is_file():
+        return result
+    visited: set[Path] = set()
+
+    def visit(path: Path) -> None:
+        logical = Path(os.path.abspath(path))
+        try:
+            logical_relative = logical.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"Syncthing ignore include escapes the folder root: {path}") from error
+        resolved = logical.resolve(strict=True)
+        try:
+            relative = resolved.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"Syncthing ignore include escapes the folder root: {path}") from error
+        for control_relative in {logical_relative, relative}:
+            result.add(control_relative.as_posix())
+            for parent in control_relative.parents:
+                if parent != Path("."):
+                    result.add(parent.as_posix())
+        if resolved in visited:
+            return
+        visited.add(resolved)
+        for raw_line in resolved.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line.startswith("#include "):
+                include_name = line[len("#include "):].strip()
+                if include_name:
+                    visit(logical.parent / include_name)
+
+    visit(first)
+    return result
+
+
+class IgnoreMatcher:
+    def __init__(
+        self,
+        expanded_patterns: Iterable[str],
+        control_paths: Iterable[str] = (".stignore", ".stfolder"),
+    ) -> None:
+        self.patterns: list[CompiledIgnorePattern] = []
+        self.control_paths = set(control_paths)
+        self.traversal_rules: list[TraversalRule] = []
+        for raw in expanded_patterns:
+            pattern, case_insensitive, negated = strip_pattern_prefixes(raw.strip())
+            if not pattern or pattern.startswith("//"):
+                continue
+            flags = re.IGNORECASE if case_insensitive else 0
+            for expanded in expand_braces(pattern.lstrip("/")):
+                pattern_index = len(self.patterns)
+                self.patterns.append(
+                    CompiledIgnorePattern(re.compile(rf"\A{glob_to_regex(expanded)}\Z", flags), negated)
+                )
+                if not negated:
+                    continue
+                prefix, subtree = literal_prefix(expanded)
+                # Syncthing can skip an ignored directory only when every
+                # preceding negation is rooted at the top level. A terminal
+                # "/**" (or "**" within that top-level component) is safe;
+                # nested paths and earlier double-stars require traversal
+                # everywhere. The REST API's expanded patterns may no longer
+                # retain the original leading slash, so infer this from the
+                # expanded path shape.
+                skip_check = expanded.removesuffix("/**")
+                double_star_check = skip_check.removesuffix("**")
+                requires_global_traversal = (
+                    "/" in skip_check or "**" in double_star_check
+                )
+                if requires_global_traversal:
+                    prefix = None
+                elif not prefix:
+                    continue
+                self.traversal_rules.append(
+                    TraversalRule(pattern_index, prefix, subtree, case_insensitive)
+                )
+
+    def first_match(self, relative_path: str) -> tuple[int, CompiledIgnorePattern] | None:
+        for index, pattern in enumerate(self.patterns):
+            if pattern.regex.fullmatch(relative_path):
+                return index, pattern
+        return None
+
+    def is_included(self, relative_path: str) -> bool:
+        normalized = relative_path.replace(os.sep, "/").strip("/")
+        if not normalized:
+            return True
+        match = self.first_match(normalized)
+        return True if match is None else match[1].negated
+
+    def is_control_path(self, relative_path: str) -> bool:
+        return relative_path.replace(os.sep, "/").strip("/") in self.control_paths
+
+    def directory_requires_access(self, relative_path: str) -> bool:
+        normalized = relative_path.replace(os.sep, "/").strip("/")
+        if not normalized or self.is_control_path(normalized):
+            return True
+        if any(item.startswith(normalized + "/") for item in self.control_paths):
+            return True
+        match = self.first_match(normalized)
+        if match is None or match[1].negated:
+            return True
+        ignore_index = match[0]
+        for rule in self.traversal_rules:
+            if rule.pattern_index >= ignore_index:
+                continue
+            if rule.prefix is None:
+                return True
+            candidate = normalized.casefold() if rule.case_insensitive else normalized
+            prefix = rule.prefix.casefold() if rule.case_insensitive else rule.prefix
+            if prefix == candidate or prefix.startswith(candidate + "/"):
+                return True
+            if rule.subtree and candidate.startswith(prefix + "/"):
+                return True
+        return False
+
+
+def read_ignore_matcher(gui: GuiConfiguration, folder_id: str, root: Path) -> IgnoreMatcher:
+    payload = api_json(gui, "/rest/db/ignores", {"folder": folder_id})
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unexpected ignore response for folder {folder_id}")
+    raw, expanded = payload.get("ignore") or [], payload.get("expanded") or []
+    if not isinstance(raw, list) or not isinstance(expanded, list):
+        raise ValueError(f"Invalid ignore response for folder {folder_id}")
+    return IgnoreMatcher(
+        [str(item) for item in expanded], discover_control_paths(root)
+    )
+
+
+@dataclass(frozen=True)
+class FolderPolicy:
+    folder_id: str
+    root: Path
+    matcher: IgnoreMatcher
+
+
+def load_policies(config_path: Path, home: Path) -> list[FolderPolicy]:
+    gui, folders = read_configuration(config_path, home)
+    return [
+        FolderPolicy(folder.folder_id, folder.path, read_ignore_matcher(gui, folder.folder_id, folder.path))
+        for folder in folders
+    ]
+
+
+class ManagedTarget:
+    def __init__(self, fd: int, display_path: Path, mode: int) -> None:
+        self.fd, self.display_path, self.mode = fd, display_path, mode
+
+    @property
+    def proc_path(self) -> str:
+        return f"/proc/self/fd/{self.fd}"
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __enter__(self) -> "ManagedTarget":
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
+
+
+class ManagedRoot:
+    def __init__(self, path: Path) -> None:
+        self.path = Path(os.path.abspath(path))
+        self.fd = -1
+        self.resolved = Path()
+        self.device = self.inode = 0
+
+    def __enter__(self) -> "ManagedRoot":
+        self.fd = os.open(self.path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        metadata = os.fstat(self.fd)
+        self.device, self.inode = metadata.st_dev, metadata.st_ino
+        rendered = os.readlink(f"/proc/self/fd/{self.fd}")
+        if rendered.endswith(" (deleted)"):
+            self.close()
+            raise UnsafePathError(f"Managed root disappeared while opening: {self.path}")
+        self.resolved = Path(rendered)
+        return self
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
+
+    def open_target(self, path: Path) -> ManagedTarget:
+        path = Path(os.path.abspath(path))
+        try:
+            relative = path.relative_to(self.path)
+        except ValueError as error:
+            raise UnsafePathError(f"Path is outside managed root: {path}") from error
+        fd = os.open(
+            os.fspath(relative) if relative.parts else ".",
+            os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=self.fd,
+        )
+        try:
+            metadata = os.fstat(fd)
+            rendered = os.readlink(f"/proc/self/fd/{fd}")
+            if rendered.endswith(" (deleted)"):
+                raise FileNotFoundError(path)
+            try:
+                Path(rendered).relative_to(self.resolved)
+            except ValueError as error:
+                raise UnsafePathError(f"Path escaped managed root through a symbolic link: {path}") from error
+            return ManagedTarget(fd, path, metadata.st_mode)
+        except BaseException:
+            os.close(fd)
+            raise
+
+
+def permission_bits(value: str) -> int:
+    return sum(bit for character, bit in PERMISSION_BITS.items() if character in value)
+
+
+def permission_text(value: int) -> str:
+    return "".join(character if value & bit else "-" for character, bit in PERMISSION_BITS.items())
+
+
+def acl_entries(target: ManagedTarget) -> dict[str, int]:
+    result = subprocess.run(
+        ("getfacl", "-cp", "--", target.proc_path),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        pass_fds=(target.fd,),
+    )
+    entries: dict[str, int] = {}
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if line:
+            key, separator, permissions = line.rpartition(":")
+            if separator:
+                entries[key + ":"] = permission_bits(permissions)
+    return entries
+
+
+def run_setfacl(target: ManagedTarget, arguments: list[str]) -> None:
+    subprocess.run(
+        ("setfacl", *arguments, "--", target.proc_path),
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        pass_fds=(target.fd,),
+    )
+
+
+def unmanaged_mask_conflicts(
+    entries: dict[str, int], prefix: str, old_mask: int, new_mask: int
+) -> list[str]:
+    added = new_mask & ~old_mask
+    managed = {f"{prefix}user:{user}:" for user in ACL_USERS}
+    conflicts: list[str] = []
+    for key, raw_permissions in entries.items():
+        affected = (
+            key == f"{prefix}group::"
+            or key.startswith(f"{prefix}group:")
+            or key.startswith(f"{prefix}user:")
+        )
+        if affected and key not in managed and key != f"{prefix}user::" and raw_permissions & added:
+            conflicts.append(key)
+    return conflicts
+
+
+def has_unmanaged_execute(entries: dict[str, int], mask: int) -> bool:
+    if entries.get("user::", 0) & 1 or entries.get("other::", 0) & 1:
+        return True
+    if entries.get("group::", 0) & mask & 1:
+        return True
+    managed = {f"user:{user}:" for user in ACL_USERS}
+    return any(
+        not key.startswith("default:")
+        and key not in managed
+        and key not in {"user::", "group::", "other::", "mask::"}
+        and (key.startswith("user:") or key.startswith("group:"))
+        and raw_permissions & mask & 1
+        for key, raw_permissions in entries.items()
+    )
+
+
+def _set_managed_target_access(target: ManagedTarget, should_have_access: bool) -> AclOutcome:
+    try:
+        entries = acl_entries(target)
+        directory, regular = stat.S_ISDIR(target.mode), stat.S_ISREG(target.mode)
+        if not (should_have_access and (directory or regular)):
+            removals: list[str] = []
+            for user in ACL_USERS:
+                if f"user:{user}:" in entries:
+                    removals.append(f"u:{user}")
+                if directory and f"default:user:{user}:" in entries:
+                    removals.append(f"d:u:{user}")
+            if not removals:
+                return AclOutcome.UNCHANGED
+            run_setfacl(target, ["-n", "-x", ",".join(removals)])
+            log(f"Managed ACL removed: {target.display_path}")
+            return AclOutcome.CHANGED
+
+        old_mask = entries.get("mask::", entries.get("group::", 0))
+        desired_access = 7 if directory or has_unmanaged_execute(entries, old_mask) else 6
+        new_mask = old_mask | desired_access
+        conflicts = unmanaged_mask_conflicts(entries, "", old_mask, new_mask)
+        default_exists = "default:user::" in entries
+        old_default_mask = entries.get("default:mask::", entries.get("default:group::", 0))
+        new_default_mask = old_default_mask | 7
+        if directory and default_exists:
+            conflicts += unmanaged_mask_conflicts(entries, "default:", old_default_mask, new_default_mask)
+        if conflicts:
+            log(
+                f"ACL mask conflict for {target.display_path}; unmanaged entries would gain rights: "
+                + ",".join(conflicts)
+            )
+            return AclOutcome.FAILED
+        access_ok = all(
+            entries.get(f"user:{user}:", 0) == desired_access
+            and (entries[f"user:{user}:"] & old_mask) == desired_access
+            for user in ACL_USERS
+        )
+        default_ok = not directory or default_exists and all(
+            entries.get(f"default:user:{user}:", 0) == 7
+            and (entries[f"default:user:{user}:"] & old_default_mask) == 7
+            for user in ACL_USERS
+        )
+        if access_ok and default_ok:
+            return AclOutcome.UNCHANGED
+        specifications = [f"u:{user}:{permission_text(desired_access)}" for user in ACL_USERS]
+        specifications.append(f"m::{permission_text(new_mask)}")
+        if directory:
+            if not default_exists:
+                specifications.extend(("d:u::rwx", "d:g::---", "d:o::---"))
+            specifications.extend(f"d:u:{user}:rwx" for user in ACL_USERS)
+            specifications.append(f"d:m::{permission_text(new_default_mask)}")
+        run_setfacl(target, ["-n", "-m", ",".join(specifications)])
+        log(f"Managed ACL granted: {target.display_path}")
+        return AclOutcome.CHANGED
+    except FileNotFoundError:
+        return AclOutcome.GONE
+    except (OSError, subprocess.CalledProcessError) as error:
+        log(f"ACL update failed for {target.display_path}: {error}")
+        return AclOutcome.FAILED
+
+
+def set_managed_access(target_or_path: ManagedTarget | Path, should_have_access: bool) -> AclOutcome:
+    if isinstance(target_or_path, ManagedTarget):
+        return _set_managed_target_access(target_or_path, should_have_access)
+    path = Path(target_or_path)
+    try:
+        with ManagedRoot(path.parent) as root, root.open_target(path) as target:
+            return _set_managed_target_access(target, should_have_access)
+    except FileNotFoundError:
+        return AclOutcome.GONE
+    except (OSError, UnsafePathError) as error:
+        log(f"ACL target rejected for {path}: {error}")
+        return AclOutcome.FAILED
+
+
+class StateStore:
+    COLUMNS = {"path", "ctime_ns", "desired", "anchor", "anchor_dev", "anchor_ino"}
+
+    def __init__(self, path: Path | None = None) -> None:
+        path = STATE_PATH if path is None else path
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        self.connection = sqlite3.connect(path, timeout=30)
+        self.connection.execute("PRAGMA journal_mode=WAL")
+        self.connection.execute("PRAGMA synchronous=NORMAL")
+        columns = {row[1] for row in self.connection.execute("PRAGMA table_info(paths)")}
+        if columns and columns != self.COLUMNS:
+            self.connection.execute("DROP TABLE paths")
+        self.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paths (
+                path TEXT PRIMARY KEY,
+                ctime_ns INTEGER NOT NULL,
+                desired INTEGER NOT NULL,
+                anchor TEXT NOT NULL,
+                anchor_dev INTEGER NOT NULL,
+                anchor_ino INTEGER NOT NULL
+            )
+            """
+        )
+        self.connection.commit()
+
+    def get(self, path: Path) -> tuple[int, bool, str, int, int] | None:
+        row = self.connection.execute(
+            "SELECT ctime_ns, desired, anchor, anchor_dev, anchor_ino FROM paths WHERE path = ?",
+            (os.fspath(path),),
+        ).fetchone()
+        return (int(row[0]), bool(row[1]), str(row[2]), int(row[3]), int(row[4])) if row else None
+
+    def put(self, target: ManagedTarget, desired: bool, anchor: ManagedRoot) -> None:
+        metadata = os.fstat(target.fd)
+        self.connection.execute(
+            """
+            INSERT INTO paths(path, ctime_ns, desired, anchor, anchor_dev, anchor_ino)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET ctime_ns=excluded.ctime_ns,
+                desired=excluded.desired, anchor=excluded.anchor,
+                anchor_dev=excluded.anchor_dev, anchor_ino=excluded.anchor_ino
+            """,
+            (
+                os.fspath(target.display_path), metadata.st_ctime_ns, int(desired),
+                os.fspath(anchor.path), anchor.device, anchor.inode,
+            ),
+        )
+
+    def delete(self, path: Path) -> None:
+        self.connection.execute("DELETE FROM paths WHERE path = ?", (os.fspath(path),))
+
+    def delete_prefix(self, path: Path) -> None:
+        value = os.fspath(path)
+        escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        self.connection.execute(
+            "DELETE FROM paths WHERE path = ? OR path LIKE ? ESCAPE '\\'", (value, escaped + "/%")
+        )
+
+    def delete_anchor(self, anchor: Path, anchor_dev: int, anchor_ino: int) -> None:
+        self.connection.execute(
+            "DELETE FROM paths WHERE anchor = ? AND anchor_dev = ? AND anchor_ino = ?",
+            (os.fspath(anchor), anchor_dev, anchor_ino),
+        )
+
+    def iter_items(self, batch_size: int = 512) -> Iterator[tuple[Path, int, bool, Path, int, int]]:
+        last_path = ""
+        while rows := self.connection.execute(
+            """
+            SELECT path, ctime_ns, desired, anchor, anchor_dev, anchor_ino
+            FROM paths WHERE path > ? ORDER BY path LIMIT ?
+            """,
+            (last_path, batch_size),
+        ).fetchall():
+            for path, ctime_ns, desired, anchor, anchor_dev, anchor_ino in rows:
+                last_path = str(path)
+                yield Path(path), int(ctime_ns), bool(desired), Path(anchor), int(anchor_dev), int(anchor_ino)
+
+    def commit(self) -> None:
+        self.connection.commit()
+
+    def close(self) -> None:
+        self.connection.commit()
+        self.connection.close()
+
+
+@dataclass
+class ReconcileStats:
+    visited: int = 0
+    acl_reads: int = 0
+    changed: int = 0
+    failed: int = 0
+    elapsed: float = 0.0
+
+    def absorb(self, other: "ReconcileStats") -> None:
+        self.visited += other.visited
+        self.acl_reads += other.acl_reads
+        self.changed += other.changed
+        self.failed += other.failed
+
+
+def choose_allowed_root(path: Path, roots: Iterable[Path]) -> Path:
+    candidates = [root for root in roots if path == root or path.is_relative_to(root)]
+    if not candidates:
+        raise UnsafePathError(f"No managed root contains {path}")
+    return max(candidates, key=lambda item: len(item.parts))
+
+
+def reconcile_path(
+    path: Path,
+    desired: bool,
+    state: StateStore,
+    force: bool = False,
+    allowed_roots: Iterable[Path] | None = None,
+    managed_root: ManagedRoot | None = None,
+) -> ReconcileStats:
+    stats = ReconcileStats(visited=1)
+    if managed_root is None:
+        try:
+            root_path = choose_allowed_root(path, allowed_roots or [path.parent])
+            with ManagedRoot(root_path) as opened:
+                return reconcile_path(path, desired, state, force, managed_root=opened)
+        except FileNotFoundError:
+            state.delete_prefix(path)
+            return stats
+        except (OSError, UnsafePathError) as error:
+            log(f"ACL target rejected for {path}: {error}")
+            stats.failed = 1
+            return stats
+    try:
+        with managed_root.open_target(path) as target:
+            if stat.S_ISLNK(target.mode):
+                state.delete(path)
+                return stats
+            desired = desired and (stat.S_ISDIR(target.mode) or stat.S_ISREG(target.mode))
+            metadata = os.fstat(target.fd)
+            current_key = (
+                metadata.st_ctime_ns, desired, os.fspath(managed_root.path),
+                managed_root.device, managed_root.inode,
+            )
+            if not force and state.get(path) == current_key:
+                return stats
+            stats.acl_reads = 1
+            outcome = set_managed_access(target, desired)
+            if outcome in {AclOutcome.UNCHANGED, AclOutcome.CHANGED}:
+                state.put(target, desired, managed_root)
+                stats.changed = int(outcome is AclOutcome.CHANGED)
+            elif outcome is AclOutcome.GONE:
+                state.delete_prefix(path)
+            else:
+                stats.failed = 1
+    except FileNotFoundError:
+        state.delete_prefix(path)
+    except (OSError, UnsafePathError) as error:
+        log(f"ACL target rejected for {path}: {error}")
+        stats.failed = 1
+    return stats
+
+
+def desired_for_matcher(path: Path, root: Path, matcher: IgnoreMatcher, directory: bool) -> bool:
+    if path == root:
+        return True
+    relative = path.relative_to(root).as_posix()
+    if matcher.is_control_path(relative):
+        return True
+    return matcher.directory_requires_access(relative) if directory else matcher.is_included(relative)
+
+
+def walk_paths(root: Path) -> Iterator[Path]:
+    if not root.exists() and not root.is_symlink():
+        return
+    if not root.is_dir() or root.is_symlink():
+        yield root
+        return
+    for directory, directory_names, file_names in os.walk(
+        root, followlinks=False, onerror=lambda error: log(f"Tree scan failed: {error}")
+    ):
+        directory_path = Path(directory)
+        directory_names[:] = [name for name in directory_names if not (directory_path / name).is_symlink()]
+        yield directory_path
+        for file_name in file_names:
+            file_path = directory_path / file_name
+            if not file_path.is_symlink():
+                yield file_path
+
+
+def reconcile_tree(
+    root: Path,
+    desired_for_path: Callable[[Path, bool], bool],
+    state: StateStore,
+    managed_root: ManagedRoot,
+    force: bool = False,
+) -> ReconcileStats:
+    stats = ReconcileStats()
+    for path in walk_paths(root):
+        try:
+            directory = path.is_dir()
+        except OSError:
+            continue
+        stats.absorb(
+            reconcile_path(path, desired_for_path(path, directory), state, force, managed_root=managed_root)
+        )
+    state.commit()
+    return stats
+
+
+def reconcile_root(root: Path, matcher: IgnoreMatcher, state: StateStore, force: bool = False) -> ReconcileStats:
+    root = Path(os.path.abspath(root))
+    started = time.monotonic()
+    with ManagedRoot(root) as managed_root:
+        stats = reconcile_tree(
+            root, lambda path, directory: desired_for_matcher(path, root, matcher, directory),
+            state, managed_root, force,
+        )
+    stats.elapsed = time.monotonic() - started
+    return stats
+
+
+def compact_roots(roots: Iterable[Path]) -> list[Path]:
+    compacted: list[Path] = []
+    for root in sorted(set(roots), key=lambda item: (len(item.parts), os.fspath(item))):
+        if not any(root == parent or root.is_relative_to(parent) for parent in compacted):
+            compacted.append(root)
+    return compacted
+
+
+def policies_for_path(path: Path, policies: Iterable[FolderPolicy]) -> list[FolderPolicy]:
+    return [policy for policy in policies if path == policy.root or path.is_relative_to(policy.root)]
+
+
+def desired_for_policies(path: Path, directory: bool, policies: list[FolderPolicy]) -> bool:
+    return any(
+        desired_for_matcher(path, policy.root, policy.matcher, directory)
+        for policy in policies_for_path(path, policies)
+    )
+
+
+def reconcile_removed_state(
+    state: StateStore, policies: list[FolderPolicy], stats: ReconcileStats, force: bool
+) -> None:
+    invalid_anchors: set[tuple[Path, int, int]] = set()
+    for path, _ctime, _desired, anchor, anchor_dev, anchor_ino in state.iter_items():
+        anchor_key = (anchor, anchor_dev, anchor_ino)
+        if anchor_key in invalid_anchors:
+            continue
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            state.delete(path)
+            continue
+        if stat.S_ISLNK(metadata.st_mode):
+            state.delete(path)
+            continue
+        if policies_for_path(path, policies):
+            continue
+        try:
+            with ManagedRoot(anchor) as managed_root:
+                if (managed_root.device, managed_root.inode) != (anchor_dev, anchor_ino):
+                    invalid_anchors.add(anchor_key)
+                    state.delete_anchor(anchor, anchor_dev, anchor_ino)
+                    stats.failed += 1
+                    log(
+                        f"Former managed root identity changed; cached ACL cleanup was quarantined: {anchor}"
+                    )
+                    continue
+                result = reconcile_path(path, False, state, force, managed_root=managed_root)
+                stats.absorb(result)
+                if not result.failed:
+                    state.delete(path)
+        except (OSError, UnsafePathError) as error:
+            log(f"Cannot safely revoke ACL under former root {anchor}: {error}")
+            stats.failed += 1
+
+
+def reconcile_all(policies: list[FolderPolicy], state: StateStore, force: bool = False) -> ReconcileStats:
+    started = time.monotonic()
+    stats = ReconcileStats()
+    roots = compact_roots(policy.root for policy in policies)
+    for root in roots:
+        if not root.is_dir():
+            log(f"Configured folder is not available yet: {root}")
+            continue
+        try:
+            with ManagedRoot(root) as managed_root:
+                stats.absorb(
+                    reconcile_tree(
+                        root,
+                        lambda path, directory: desired_for_policies(path, directory, policies),
+                        state, managed_root, force,
+                    )
+                )
+        except (OSError, UnsafePathError) as error:
+            log(f"Cannot safely scan managed root {root}: {error}")
+            stats.failed += 1
+    reconcile_removed_state(state, policies, stats, force)
+    state.commit()
+    stats.elapsed = time.monotonic() - started
+    log(
+        f"Full reconciliation complete: folders={len(policies)} roots={len(roots)} "
+        f"visited={stats.visited} acl_reads={stats.acl_reads} changed={stats.changed} "
+        f"failed={stats.failed} elapsed={stats.elapsed:.3f}s"
+    )
+    return stats
+
+
+def reconcile_event_path(path: Path, policies: list[FolderPolicy], state: StateStore) -> ReconcileStats:
+    path = Path(os.path.abspath(path))
+    applicable = policies_for_path(path, policies)
+    if not applicable:
+        state.delete_prefix(path)
+        state.commit()
+        return ReconcileStats()
+    root = choose_allowed_root(path, compact_roots(policy.root for policy in applicable))
+    if path.is_dir() and not path.is_symlink():
+        with ManagedRoot(root) as managed_root:
+            return reconcile_tree(
+                path, lambda item, directory: desired_for_policies(item, directory, policies),
+                state, managed_root,
+            )
+    stats = reconcile_path(path, desired_for_policies(path, False, policies), state, allowed_roots=[root])
+    state.commit()
+    return stats
+
+
+def is_control_event(path: Path, policies: list[FolderPolicy]) -> bool:
+    for policy in policies_for_path(path, policies):
+        if path != policy.root and policy.matcher.is_control_path(path.relative_to(policy.root).as_posix()):
+            return True
+    return False
+
+
+def seconds_until_next_refresh() -> float:
+    now = dt.datetime.now(dt.timezone.utc)
+    next_hour = ((now.hour // FULL_REFRESH_HOURS) + 1) * FULL_REFRESH_HOURS
+    next_run = (
+        (now + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        if next_hour >= 24
+        else now.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+    )
+    log(f"Next full reconciliation: {next_run.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+    return max(0.0, (next_run - now).total_seconds())
+
+
+@dataclass
+class RetryBackoff:
+    initial_seconds: float = 5
+    maximum_seconds: float = 300
+    due_at: float | None = None
+    next_delay: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.next_delay = self.initial_seconds
+
+    def trigger(self, now: float) -> None:
+        self.due_at = now
+
+    def failed(self, now: float) -> None:
+        if self.due_at is not None and now < self.due_at:
+            return
+        self.due_at = now + self.next_delay
+        self.next_delay = min(self.maximum_seconds, self.next_delay * 2)
+
+    def succeeded(self) -> None:
+        self.due_at = None
+        self.next_delay = self.initial_seconds
+
+    def is_due(self, now: float) -> bool:
+        return self.due_at is not None and now >= self.due_at
+
+
+def events_require_full_reconciliation(events: set[str]) -> bool:
+    return bool({"Q_OVERFLOW", "DELETE_SELF", "MOVE_SELF"} & events)
+
+
+def record_reconciliation_result(stats: ReconcileStats, retry: RetryBackoff, now: float) -> bool:
+    if stats.failed:
+        retry.failed(now)
+        assert retry.due_at is not None
+        log(f"ACL reconciliation will be retried after {retry.due_at - now:.0f}s")
+        return True
+    retry.succeeded()
+    return False
+
+
+@dataclass
+class Watcher:
+    kind: str
+    process: subprocess.Popen[bytes]
+    buffer: bytearray = field(default_factory=bytearray)
+
+
+def start_inotify(kind: str, paths: list[Path], recursive: bool) -> Watcher | None:
+    if not paths:
+        return None
+    command = ["inotifywait", "--monitor", "--quiet"]
+    if recursive:
+        command.append("--recursive")
+    for event in INOTIFY_EVENTS:
+        command.extend(("--event", event))
+    command.extend(("--format", "%e|%w%f"))
+    command.extend(os.fspath(path) for path in paths)
+    return Watcher(kind, subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0))
+
+
+def start_watchers(config_path: Path, policies: list[FolderPolicy]) -> tuple[selectors.BaseSelector, list[Watcher]]:
+    selector = selectors.DefaultSelector()
+    existing = [root for root in compact_roots(policy.root for policy in policies) if root.is_dir()]
+    candidates = [
+        start_inotify("config", [config_path.parent], False),
+        start_inotify("folders", existing, True),
+    ]
+    watchers = [watcher for watcher in candidates if watcher is not None]
+    for watcher in watchers:
+        assert watcher.process.stdout is not None
+        selector.register(watcher.process.stdout, selectors.EVENT_READ, watcher)
+    return selector, watchers
+
+
+def stop_watchers(selector: selectors.BaseSelector, watchers: list[Watcher]) -> None:
+    for watcher in watchers:
+        if watcher.process.stdout is not None:
+            try:
+                selector.unregister(watcher.process.stdout)
+            except (KeyError, ValueError):
+                pass
+        if watcher.process.poll() is None:
+            watcher.process.terminate()
+    for watcher in watchers:
+        if watcher.process.poll() is None:
+            try:
+                watcher.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                watcher.process.kill()
+                watcher.process.wait(timeout=5)
+    selector.close()
+
+
+def parse_event(line: bytes | bytearray) -> tuple[set[str], Path] | None:
+    payload = bytes(line)
+    try:
+        raw_events, raw_path = payload.split(b"|", 1)
+    except ValueError:
+        if payload:
+            log(f"inotifywait: {os.fsdecode(payload)}")
+        return None
+    return set(os.fsdecode(raw_events).split(",")), Path(os.fsdecode(raw_path))
+
+
+def daemon() -> int:
+    home = syncthing_home()
+    config_path = locate_config(home)
+    policies = load_policies(config_path, home)
+    state = StateStore()
+    tree_retry = RetryBackoff(maximum_seconds=3600)
+    tree_dirty = record_reconciliation_result(
+        reconcile_all(policies, state), tree_retry, time.monotonic()
+    )
+    selector, watchers = start_watchers(config_path, policies)
+    policy_retry, watcher_retry = RetryBackoff(), RetryBackoff()
+    policy_dirty = watchers_dirty = False
+    next_full = time.monotonic() + seconds_until_next_refresh()
+    next_missing = time.monotonic() + MISSING_FOLDER_RECHECK_SECONDS
+
+    def request_stop(_signal: int, _frame: object) -> None:
+        raise StopRequested
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    try:
+        while True:
+            now = time.monotonic()
+            roots = compact_roots(policy.root for policy in policies)
+            has_missing = any(not root.is_dir() for root in roots)
+            deadlines = [next_full]
+            if has_missing:
+                deadlines.append(next_missing)
+            if policy_dirty and policy_retry.due_at is not None:
+                deadlines.append(policy_retry.due_at)
+            if watchers_dirty and watcher_retry.due_at is not None:
+                deadlines.append(watcher_retry.due_at)
+            if tree_dirty and tree_retry.due_at is not None:
+                deadlines.append(tree_retry.due_at)
+            ready = selector.select(max(0.0, min(deadlines) - now))
+            now = time.monotonic()
+            if now >= next_full:
+                policy_dirty = tree_dirty = True
+                policy_retry.trigger(now)
+                next_full = now + seconds_until_next_refresh()
+            if has_missing and now >= next_missing:
+                tree_dirty = watchers_dirty = True
+                tree_retry.trigger(now)
+                watcher_retry.trigger(now)
+                next_missing = now + MISSING_FOLDER_RECHECK_SECONDS
+
+            watcher_failed = False
+            for key, _mask in ready:
+                watcher: Watcher = key.data
+                chunk = os.read(key.fileobj.fileno(), 65536)
+                if not chunk:
+                    log(f"{watcher.kind} watcher exited; entering retry backoff")
+                    watcher_failed = tree_dirty = True
+                    continue
+                watcher.buffer.extend(chunk)
+                while b"\n" in watcher.buffer:
+                    line, _, remainder = watcher.buffer.partition(b"\n")
+                    watcher.buffer = bytearray(remainder)
+                    parsed = parse_event(line)
+                    if parsed is None:
+                        continue
+                    events, event_path = parsed
+                    event_path = Path(os.path.abspath(event_path))
+                    if events_require_full_reconciliation(events):
+                        tree_dirty = True
+                        tree_retry.trigger(now)
+                    if "Q_OVERFLOW" in events:
+                        continue
+                    if watcher.kind == "config" and event_path == config_path:
+                        policy_dirty = True
+                        policy_retry.trigger(now)
+                    elif watcher.kind == "folders" and is_control_event(event_path, policies) and (
+                        {"CLOSE_WRITE", "MOVED_TO", "CREATE", "DELETE"} & events
+                    ):
+                        policy_dirty = True
+                        policy_retry.trigger(now)
+                    elif watcher.kind == "folders":
+                        event_stats = reconcile_event_path(event_path, policies, state)
+                        if event_stats.failed:
+                            tree_dirty = True
+                            tree_retry.failed(now)
+
+            if watcher_failed:
+                stop_watchers(selector, watchers)
+                selector, watchers = selectors.DefaultSelector(), []
+                watchers_dirty = True
+                tree_retry.trigger(now)
+                watcher_retry.failed(now)
+            if policy_dirty and policy_retry.is_due(now):
+                try:
+                    config_path = locate_config(home)
+                    policies = load_policies(config_path, home)
+                except (OSError, ET.ParseError, ValueError, KeyError) as error:
+                    log(f"Cannot reload Syncthing policy; retrying: {error}")
+                    policy_retry.failed(now)
+                else:
+                    policy_dirty = False
+                    policy_retry.succeeded()
+                    tree_dirty = watchers_dirty = True
+                    tree_retry.trigger(now)
+                    if watchers:
+                        stop_watchers(selector, watchers)
+                        selector, watchers = selectors.DefaultSelector(), []
+                    watcher_retry.trigger(now)
+            if tree_dirty and not policy_dirty and tree_retry.is_due(now):
+                tree_dirty = record_reconciliation_result(
+                    reconcile_all(policies, state), tree_retry, now
+                )
+            if watchers_dirty and watcher_retry.is_due(now):
+                try:
+                    replacement_selector, replacement_watchers = start_watchers(config_path, policies)
+                except OSError as error:
+                    log(f"Cannot start filesystem watchers; retrying: {error}")
+                    watcher_retry.failed(now)
+                else:
+                    selector, watchers = replacement_selector, replacement_watchers
+                    watchers_dirty = False
+                    watcher_retry.succeeded()
+    except StopRequested:
+        pass
+    finally:
+        stop_watchers(selector, watchers)
+        state.close()
+    return 0
+
+
+def scan_once(force: bool = False) -> int:
+    home = syncthing_home()
+    policies = load_policies(locate_config(home), home)
+    state = StateStore()
+    try:
+        return 1 if reconcile_all(policies, state, force).failed else 0
+    finally:
+        state.close()
+
+
+def main() -> int:
+    try:
+        settings = parse_runtime_settings()
+        apply_runtime_settings(settings)
+        pwd.getpwnam(SYNCTHING_USER)
+        for user in ACL_USERS:
+            pwd.getpwnam(user)
+        return scan_once(settings.force) if settings.scan else daemon()
+    except (OSError, ET.ParseError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        log(f"Fatal error: {error}")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

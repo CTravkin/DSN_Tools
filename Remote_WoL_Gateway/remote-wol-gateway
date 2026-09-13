@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import hmac
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import time
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable, Mapping
+from urllib.parse import urlparse
+
+
+SERVICE_NAME = "remote-wol-gateway"
+
+
+class ConfigurationError(ValueError):
+    pass
+
+
+def _required(environment: Mapping[str, str], name: str) -> str:
+    value = environment.get(name, "").strip()
+    if not value:
+        raise ConfigurationError(f"{name} is required")
+    return value
+
+
+def _integer(environment: Mapping[str, str], name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(environment.get(name, str(default)))
+    except ValueError as error:
+        raise ConfigurationError(f"{name} must be an integer") from error
+    if not minimum <= value <= maximum:
+        raise ConfigurationError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _boolean(environment: Mapping[str, str], name: str, default: bool) -> bool:
+    value = environment.get(name, "true" if default else "false").strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigurationError(f"{name} must be true or false")
+
+
+def _mac(value: str) -> str:
+    compact = value.replace(":", "").replace("-", "")
+    if not re.fullmatch(r"[0-9A-Fa-f]{12}", compact):
+        raise ConfigurationError("WOL_TARGET_MAC must contain six hexadecimal bytes")
+    return ":".join(compact[index : index + 2] for index in range(0, 12, 2)).upper()
+
+
+def _ports(value: str) -> tuple[int, ...]:
+    if not value.strip():
+        return ()
+    result = []
+    for item in value.split(","):
+        try:
+            port = int(item.strip())
+        except ValueError as error:
+            raise ConfigurationError("WOL_CHECK_PORTS must be a comma-separated port list") from error
+        if not 1 <= port <= 65535:
+            raise ConfigurationError("WOL_CHECK_PORTS contains an invalid port")
+        if port not in result:
+            result.append(port)
+    return tuple(result)
+
+
+@dataclass(frozen=True)
+class Settings:
+    token: str
+    target_ip: str
+    target_mac: str
+    target_name: str
+    bind: str
+    port: int
+    wait_seconds: int
+    probe_interval_seconds: int
+    check_ping: bool
+    check_ports: tuple[int, ...]
+    send_mode: str
+    broadcast_ip: str
+    broadcast_port: int
+    ssh_host: str | None = None
+    ssh_user: str | None = None
+    ssh_key: str | None = None
+    ssh_known_hosts: str | None = None
+    ssh_interface: str | None = None
+    ssh_executable: str = "/usr/sbin/ether-wake"
+
+    @classmethod
+    def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
+        env = os.environ if environment is None else environment
+        target_ip = _required(env, "WOL_TARGET_IP")
+        try:
+            ipaddress.ip_address(target_ip)
+        except ValueError as error:
+            raise ConfigurationError("WOL_TARGET_IP must be an IP address") from error
+        bind = env.get("WOL_BIND", "127.0.0.1").strip()
+        try:
+            ipaddress.ip_address(bind)
+        except ValueError as error:
+            raise ConfigurationError("WOL_BIND must be an IP address") from error
+        broadcast = env.get("WOL_BROADCAST_IP", "255.255.255.255").strip()
+        try:
+            ipaddress.ip_address(broadcast)
+        except ValueError as error:
+            raise ConfigurationError("WOL_BROADCAST_IP must be an IP address") from error
+
+        check_ping = _boolean(env, "WOL_CHECK_PING", True)
+        check_ports = _ports(env.get("WOL_CHECK_PORTS", ""))
+        if not check_ping and not check_ports:
+            raise ConfigurationError("At least one reachability probe must be enabled")
+        send_mode = env.get("WOL_SEND_MODE", "local").strip().lower()
+        if send_mode not in {"local", "ssh"}:
+            raise ConfigurationError("WOL_SEND_MODE must be local or ssh")
+
+        ssh_values: dict[str, str | None] = {
+            "ssh_host": None,
+            "ssh_user": None,
+            "ssh_key": None,
+            "ssh_known_hosts": None,
+            "ssh_interface": None,
+        }
+        if send_mode == "ssh":
+            mapping = {
+                "ssh_host": "WOL_SSH_HOST",
+                "ssh_user": "WOL_SSH_USER",
+                "ssh_key": "WOL_SSH_KEY",
+                "ssh_known_hosts": "WOL_SSH_KNOWN_HOSTS",
+                "ssh_interface": "WOL_SSH_INTERFACE",
+            }
+            ssh_values = {field: _required(env, variable) for field, variable in mapping.items()}
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", ssh_values["ssh_host"] or ""):
+                raise ConfigurationError("WOL_SSH_HOST contains unsafe characters")
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", ssh_values["ssh_user"] or ""):
+                raise ConfigurationError("WOL_SSH_USER contains unsafe characters")
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", ssh_values["ssh_interface"] or ""):
+                raise ConfigurationError("WOL_SSH_INTERFACE contains unsafe characters")
+            for field in ("ssh_key", "ssh_known_hosts"):
+                if not os.path.isabs(ssh_values[field] or ""):
+                    raise ConfigurationError(f"WOL_{field.upper()} must be an absolute path")
+
+        executable = env.get("WOL_SSH_EXECUTABLE", "/usr/sbin/ether-wake").strip()
+        if not os.path.isabs(executable) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", executable):
+            raise ConfigurationError("WOL_SSH_EXECUTABLE must be a safe absolute path")
+
+        return cls(
+            token=_required(env, "WOL_TOKEN"),
+            target_ip=target_ip,
+            target_mac=_mac(_required(env, "WOL_TARGET_MAC")),
+            target_name=env.get("WOL_TARGET_NAME", "target").strip() or "target",
+            bind=bind,
+            port=_integer(env, "WOL_PORT", 18080, 1, 65535),
+            wait_seconds=_integer(env, "WOL_WAIT_SECONDS", 60, 1, 3600),
+            probe_interval_seconds=_integer(env, "WOL_PROBE_INTERVAL_SECONDS", 2, 1, 60),
+            check_ping=check_ping,
+            check_ports=check_ports,
+            send_mode=send_mode,
+            broadcast_ip=broadcast,
+            broadcast_port=_integer(env, "WOL_BROADCAST_PORT", 9, 1, 65535),
+            ssh_executable=executable,
+            **ssh_values,
+        )
+
+
+def build_magic_packet(mac_address: str) -> bytes:
+    hardware = bytes.fromhex(mac_address.replace(":", "").replace("-", ""))
+    if len(hardware) != 6:
+        raise ValueError("MAC address must contain six bytes")
+    return b"\xff" * 6 + hardware * 16
+
+
+def build_ssh_command(settings: Settings) -> list[str]:
+    if settings.send_mode != "ssh":
+        raise ValueError("SSH command requested for a non-SSH sender")
+    return [
+        "/usr/bin/ssh",
+        "-i", settings.ssh_key or "",
+        "-o", "BatchMode=yes",
+        "-o", "IdentitiesOnly=yes",
+        "-o", f"UserKnownHostsFile={settings.ssh_known_hosts}",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "ConnectTimeout=5",
+        f"{settings.ssh_user}@{settings.ssh_host}",
+        "--", settings.ssh_executable, "-i", settings.ssh_interface or "", settings.target_mac,
+    ]
+
+
+def run_command(arguments: list[str], timeout: int) -> bool:
+    try:
+        result = subprocess.run(arguments, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def tcp_check(host: str, port: int, timeout: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def collect_status(settings: Settings) -> dict[str, object]:
+    checks: dict[str, bool] = {}
+    if settings.check_ping:
+        checks["ping"] = run_command(["/usr/bin/ping", "-c", "1", "-W", "1", settings.target_ip], 3)
+    for port in settings.check_ports:
+        checks[f"tcp:{port}"] = tcp_check(settings.target_ip, port)
+    if settings.send_mode == "ssh":
+        checks["ssh_sender"] = run_command(build_ssh_command(settings)[:-5] + ["true"], 8)
+    reachability = [value for name, value in checks.items() if name != "ssh_sender"]
+    return {"online": any(reachability), "checks": checks}
+
+
+def send_wol(settings: Settings) -> bool:
+    if settings.send_mode == "ssh":
+        return run_command(build_ssh_command(settings), 10)
+    try:
+        packet = build_magic_packet(settings.target_mac)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            sender.sendto(packet, (settings.broadcast_ip, settings.broadcast_port))
+        return True
+    except OSError:
+        return False
+
+
+class GatewayService:
+    def __init__(
+        self,
+        settings: Settings,
+        status_collector: Callable[[], dict[str, object]] | None = None,
+        wake_sender: Callable[[], bool] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.settings = settings
+        self.status_collector = status_collector or (lambda: collect_status(settings))
+        self.wake_sender = wake_sender or (lambda: send_wol(settings))
+        self.sleep = sleep
+        self.monotonic = monotonic
+
+    def _status_payload(self) -> dict[str, object]:
+        status = dict(self.status_collector())
+        return {"ok": True, "service": SERVICE_NAME, "target": self.settings.target_name, **status}
+
+    def _authorized(self, authorization: str) -> bool:
+        prefix = "Bearer "
+        return authorization.startswith(prefix) and hmac.compare_digest(authorization[len(prefix) :], self.settings.token)
+
+    def handle(self, method: str, raw_path: str, authorization: str = "") -> tuple[int, dict[str, object]]:
+        path = urlparse(raw_path).path
+        if path not in {"/status", "/wol"}:
+            return 404, {"ok": False, "error": "not_found"}
+        if not self._authorized(authorization):
+            return 401, {"ok": False, "error": "unauthorized"}
+        if path == "/status" and method == "GET":
+            return 200, self._status_payload()
+        if path == "/wol" and method == "POST":
+            before = self._status_payload()
+            if before["online"]:
+                return 200, {**before, "action": "wol", "result": "already_online"}
+            if not self.wake_sender():
+                return 502, {"ok": False, "service": SERVICE_NAME, "target": self.settings.target_name, "action": "wol", "error": "wol_failed"}
+            deadline = self.monotonic() + self.settings.wait_seconds
+            status = self._status_payload()
+            while not status["online"] and self.monotonic() < deadline:
+                self.sleep(self.settings.probe_interval_seconds)
+                status = self._status_payload()
+            if status["online"]:
+                return 200, {**status, "action": "wol", "result": "wol_sent_online"}
+            return 202, {**status, "action": "wol", "result": "wol_sent_waiting"}
+        return 405, {"ok": False, "error": "method_not_allowed"}
+
+
+class GatewayHTTPServer(ThreadingHTTPServer):
+    def __init__(self, address: tuple[str, int], gateway: GatewayService) -> None:
+        super().__init__(address, GatewayHandler)
+        self.gateway = gateway
+
+
+class GatewayHandler(BaseHTTPRequestHandler):
+    server_version = SERVICE_NAME
+    sys_version = ""
+
+    def log_message(self, _format: str, *_arguments: object) -> None:
+        return
+
+    def _respond(self, method: str) -> None:
+        status, payload = self.server.gateway.handle(method, self.path, self.headers.get("Authorization", ""))  # type: ignore[attr-defined]
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        if status == 401:
+            self.send_header("WWW-Authenticate", 'Bearer realm="remote-wol-gateway"')
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        self._respond("GET")
+
+    def do_POST(self) -> None:
+        self._respond("POST")
+
+    def do_PUT(self) -> None:
+        self._respond("PUT")
+
+    do_DELETE = do_PUT
+    do_PATCH = do_PUT
+
+
+def main() -> int:
+    try:
+        settings = Settings.from_env()
+    except ConfigurationError as error:
+        print(f"Configuration error: {error}", flush=True)
+        return 2
+    GatewayHTTPServer((settings.bind, settings.port), GatewayService(settings)).serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
