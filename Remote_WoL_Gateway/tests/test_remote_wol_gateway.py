@@ -5,6 +5,7 @@ import pathlib
 import sys
 import threading
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -215,6 +216,30 @@ class HttpServerTests(unittest.TestCase):
         self.assertEqual("application/json; charset=utf-8", response.getheader("Content-Type"))
         self.assertNotIn("Python", response.getheader("Server", ""))
         self.assertTrue(MODULE.json.loads(body)["online"])
+
+
+class MainTests(unittest.TestCase):
+    def test_ssh_sender_outage_does_not_prevent_gateway_start(self):
+        environment = valid_environment()
+        environment.update(
+            {
+                "WOL_SEND_MODE": "ssh",
+                "WOL_SSH_HOST": "router.example",
+                "WOL_SSH_USER": "wake",
+                "WOL_SSH_KEY": "/etc/remote-wol-gateway/wake_ed25519",
+                "WOL_SSH_KNOWN_HOSTS": "/etc/remote-wol-gateway/known_hosts",
+                "WOL_SSH_INTERFACE": "br-lan",
+            }
+        )
+        settings = MODULE.Settings.from_env(environment)
+        server = mock.Mock()
+        with mock.patch.object(MODULE.Settings, "from_env", return_value=settings), mock.patch.object(
+            MODULE, "GatewayHTTPServer", return_value=server
+        ), mock.patch.object(MODULE, "run_command", return_value=False):
+            exit_code = MODULE.main()
+
+        self.assertEqual(0, exit_code)
+        server.serve_forever.assert_called_once_with()
 
 
 if __name__ == "__main__":

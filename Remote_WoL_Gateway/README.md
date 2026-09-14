@@ -55,7 +55,7 @@ sudo install -m 0755 remote-wol-sender /usr/local/sbin/remote-wol-sender
 restrict,command="/usr/local/sbin/remote-wol-sender" ssh-ed25519 AAAA...
 ```
 
-The dedicated sender account must be allowed to execute `/usr/sbin/ether-wake` on the configured interface. The gateway performs a `--check` call at startup and exits with code `3` when the helper, interface, or SSH policy is not usable.
+The dedicated sender account must be allowed to execute `/usr/sbin/ether-wake` on the configured interface. Use the helper's `--check` action to verify the interface and SSH policy during setup.
 
 Edit the installed environment file, then enable the service:
 
@@ -80,7 +80,7 @@ curl -X POST -H "Authorization: Bearer $WOL_TOKEN" http://127.0.0.1:18080/wol
 | `GET /status` | `200` with probe results | `401`, `404`, or `405` |
 | `POST /wol` | `200` when already/now online; `202` when sent but still offline | `409` wake already running; `502` send failed |
 
-Responses and access logs are JSON. Authentication headers and token values are never logged.
+Responses are JSON. Authentication headers and token values are never logged.
 
 ## Test and remove
 
@@ -90,7 +90,7 @@ python3 -m unittest discover -s tests -v
 
 To remove the service, disable it before deleting the unit, executable, environment directory, and any sender-host key authorization. No persistent application data is created.
 
-If startup fails, check the journal and run the configured SSH helper manually with `--check <interface>`. A `202` response means the packet was sent but none of the configured probes succeeded before the deadline.
+If an SSH wake fails, run the configured helper manually with `--check <interface>`. A `202` response means the packet was sent but none of the configured probes succeeded before the deadline.
 
 ## Limitations
 

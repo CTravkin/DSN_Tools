@@ -93,27 +93,27 @@ try {
 
         $changedPaths = [Collections.Generic.List[string]]::new()
         try {
-          foreach ($change in $changes) {
-            $entry = $change.Entry
-            $state = $change.State
-            if ($entry.Kind -eq 'folder') {
-                $content = if ($state.FileExists) { $state.Content } else { [pscustomobject]@{ Text=''; Encoding=[Text.UnicodeEncoding]::new($false,$true); HasBom=$true } }
-                $updated = Set-IconResourceValue -Text $content.Text -Icon $entry.Icon
-                Write-IconTextFile -Path $state.File -Text $updated -Encoding $content.Encoding -HasBom $content.HasBom
-                $desktopItem = Get-Item -LiteralPath $state.File -Force
-                $desktopItem.Attributes = $desktopItem.Attributes -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
-                $folderItem = Get-Item -LiteralPath $entry.Path -Force
-                $folderItem.Attributes = $folderItem.Attributes -bor [IO.FileAttributes]::ReadOnly
+            foreach ($change in $changes) {
+                $entry = $change.Entry
+                $state = $change.State
+                if ($entry.Kind -eq 'folder') {
+                    $content = if ($state.FileExists) { $state.Content } else { [pscustomobject]@{ Text=''; Encoding=[Text.UnicodeEncoding]::new($false,$true); HasBom=$true } }
+                    $updated = Set-IconResourceValue -Text $content.Text -Icon $entry.Icon
+                    Write-IconTextFile -Path $state.File -Text $updated -Encoding $content.Encoding -HasBom $content.HasBom
+                    $desktopItem = Get-Item -LiteralPath $state.File -Force
+                    $desktopItem.Attributes = $desktopItem.Attributes -bor [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
+                    $folderItem = Get-Item -LiteralPath $entry.Path -Force
+                    $folderItem.Attributes = $folderItem.Attributes -bor [IO.FileAttributes]::ReadOnly
+                }
+                else {
+                    $shell = New-Object -ComObject WScript.Shell
+                    $shortcut = $shell.CreateShortcut($entry.Path)
+                    $shortcut.IconLocation = $entry.Icon
+                    $shortcut.Save()
+                }
+                $changedPaths.Add($entry.Path)
             }
-            else {
-                $shell = New-Object -ComObject WScript.Shell
-                $shortcut = $shell.CreateShortcut($entry.Path)
-                $shortcut.IconLocation = $entry.Icon
-                $shortcut.Save()
-            }
-              $changedPaths.Add($entry.Path)
-          }
-          Send-IconItemRefresh -Path @($changedPaths)
+            Send-IconItemRefresh -Path @($changedPaths)
         }
         catch {
             [void](Restore-IconRecoveryBackup -BackupPath $backupPath)

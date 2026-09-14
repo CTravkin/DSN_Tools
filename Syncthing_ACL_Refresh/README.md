@@ -4,12 +4,12 @@
 
 `syncthing-acl-refresh` reconciles named POSIX ACL entries with local Syncthing folders and their effective ignore rules. Included files receive the configured users' access; excluded files lose only ACL entries managed by this utility.
 
-The process runs as root. It refuses folders that are not listed by exact Syncthing folder ID and absolute path in a root-owned allowlist. It also rejects symlinks in a managed path, nested mount boundaries, system directories, non-loopback Syncthing endpoints, plain HTTP, and ACL mask changes that would widen unrelated access.
+The process runs as root and manages only folders listed by exact Syncthing folder ID and absolute path in a root-owned allowlist. It rejects the filesystem root, symlinks in a managed path, non-loopback Syncthing endpoints, plain HTTP, and ACL mask changes that would widen unrelated access.
 
 ## Requirements
 
 - Linux, Python 3.10+, and systemd
-- `getfacl`, `setfacl`, and `inotifywait`
+- `getfacl` and `setfacl`
 - Syncthing GUI HTTPS bound to a loopback IP
 - A root-owned copy of the Syncthing GUI certificate
 - Existing local accounts named in `ACL_USERS`
@@ -21,20 +21,17 @@ Copy [`syncthing-acl-refresh.env.example`](syncthing-acl-refresh.env.example) an
 | Variable | Required | Default | Purpose |
 |---|---:|---|---|
 | `ACL_USERS` | yes | — | Comma-separated accounts whose named ACL entries are managed |
-| `LEGACY_ACL_USERS` | only for legacy migration | — | Accounts managed by the previous installation |
 | `SYNCTHING_USER` | no | `syncthing` | Account whose Syncthing configuration is read |
 | `SYNCTHING_CONFIG` | no | discovered from that account | Absolute `config.xml` path |
 | `STATE_PATH` | no | `/var/lib/syncthing-acl-refresh/state.sqlite3` | Reconciliation and revocation state |
 | `TLS_CERTIFICATE` | no | `/etc/syncthing-acl-refresh/https-cert.pem` | Pinned GUI certificate |
 | `FOLDER_ALLOWLIST` | no | `/etc/syncthing-acl-refresh/folders.conf` | Root-controlled folder allowlist |
-| `REFRESH_HOURS` | no | `3` | Full-scan interval; a positive divisor of 24 |
-| `MISSING_RECHECK_SECONDS` | no | `60` | Missing-root retry interval, 1–3600 seconds |
 
-The allowlist format is `folder-id=/absolute/path`, one entry per Syncthing folder. The file and every parent directory must be owned by root and not writable by group or others. Every configured folder must have exactly one matching entry; extra, missing, duplicate, or changed entries stop reconciliation.
+The allowlist format is `folder-id=/absolute/path`, one entry per folder that this utility should manage. The file must be owned by root and not writable by group or others. Each listed ID and path must match Syncthing configuration; unlisted Syncthing folders are ignored.
 
 CLI options override environment-file values. `--env-file` is intended for direct invocations; systemd loads the installed environment file itself.
 
-When upgrading a state database created by an older release, set `LEGACY_ACL_USERS` to the exact previous `ACL_USERS` value for the first start. Remove it after a successful migration. Migration stops without changing the database when the previous users or a managed object cannot be identified safely.
+Legacy state is migrated with the current `ACL_USERS` value. Revoke recorded ACLs before upgrading if the managed user list also changes.
 
 ## Install and run
 
@@ -45,6 +42,7 @@ sudo install -m 0600 syncthing-acl-refresh.env.example /etc/syncthing-acl-refres
 sudo install -m 0600 folders.conf.example /etc/syncthing-acl-refresh/folders.conf
 sudo install -m 0600 /path/to/syncthing-https-cert.pem /etc/syncthing-acl-refresh/https-cert.pem
 sudo install -m 0644 syncthing-acl-refresh.service /etc/systemd/system/syncthing-acl-refresh.service
+sudo install -m 0644 syncthing-acl-refresh.timer /etc/systemd/system/syncthing-acl-refresh.timer
 ```
 
 Edit both installed configuration files, then run a one-shot check before enabling the service:
@@ -52,23 +50,23 @@ Edit both installed configuration files, then run a one-shot check before enabli
 ```sh
 sudo /usr/local/sbin/syncthing-acl-refresh \
   --env-file /etc/syncthing-acl-refresh/syncthing-acl-refresh.env \
-  --scan --force
+  --force
 
 sudo systemctl daemon-reload
-sudo systemctl enable --now syncthing-acl-refresh.service
+sudo systemctl enable --now syncthing-acl-refresh.timer
 sudo journalctl -u syncthing-acl-refresh.service
 ```
 
-Continuous mode watches Syncthing configuration, the allowlist, ignore-control files, and managed trees. Periodic full scans and retry backoff cover missed or failed events.
+The timer runs a full reconciliation every 15 minutes. Default directory ACLs provide access to new children between runs; the next pass corrects any drift.
 
 ## Audit, revoke, and uninstall
 
-`--scan` exits `0` when reconciliation succeeds and `1` when any path fails. `--force` bypasses the metadata cache.
+The command exits `0` when reconciliation succeeds and `1` when any path fails. `--force` bypasses the metadata cache.
 
 Before removing a folder from the allowlist or uninstalling the utility, stop the service and revoke every ACL entry recorded in its state:
 
 ```sh
-sudo systemctl stop syncthing-acl-refresh.service
+sudo systemctl disable --now syncthing-acl-refresh.timer
 sudo /usr/local/sbin/syncthing-acl-refresh \
   --env-file /etc/syncthing-acl-refresh/syncthing-acl-refresh.env \
   --revoke-all
@@ -86,8 +84,7 @@ ACL integration tests require root, two existing users, `getfacl`, `setfacl`, `r
 
 ## Limitations
 
-- An object moved outside a watched root may retain its ACL; the unresolved state is kept for manual recovery
+- An object moved outside a managed root may retain its ACL because state is path-based
 - Hard links share one inode, so changing an in-root link also changes links to that inode elsewhere
-- Nested filesystems are rejected; configure each filesystem as its own allowlisted Syncthing folder
 - Existing unrelated default ACLs remain in effect
 - Special files never receive managed access

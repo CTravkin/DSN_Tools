@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 internal static class DesktopLauncher
@@ -28,29 +29,7 @@ internal static class DesktopLauncher
     [DllImport("user32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint attachTo, bool value);
 
-    private static string Json(string value)
-    {
-        StringBuilder result = new StringBuilder("\"");
-        foreach (char character in value ?? "")
-        {
-            switch (character)
-            {
-                case '\"': result.Append("\\\""); break;
-                case '\\': result.Append("\\\\"); break;
-                case '\b': result.Append("\\b"); break;
-                case '\f': result.Append("\\f"); break;
-                case '\n': result.Append("\\n"); break;
-                case '\r': result.Append("\\r"); break;
-                case '\t': result.Append("\\t"); break;
-                default:
-                    if (character < 0x20 || character == 0x2028 || character == 0x2029 || Char.IsSurrogate(character))
-                        result.Append("\\u").Append(((int)character).ToString("x4"));
-                    else result.Append(character);
-                    break;
-            }
-        }
-        return result.Append('\"').ToString();
-    }
+    private static string Json(string value) { return new JavaScriptSerializer().Serialize(value ?? ""); }
 
     private static bool Matches(IntPtr window)
     {

@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodically reconcile Syncthing folder ACLs
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=yes
+Unit=syncthing-acl-refresh.service
+
+[Install]
+WantedBy=timers.target

@@ -4,16 +4,12 @@ After=local-fs.target network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=oneshot
 EnvironmentFile=/etc/syncthing-acl-refresh/syncthing-acl-refresh.env
 ExecStart=/usr/local/sbin/syncthing-acl-refresh
-Restart=on-failure
-RestartSec=10s
 Nice=10
 IOSchedulingClass=idle
 UMask=0077
-KillMode=mixed
-TimeoutStopSec=15s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
@@ -25,7 +21,3 @@ ProtectHostname=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes
-
-
-[Install]
-WantedBy=multi-user.target

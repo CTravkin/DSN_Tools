@@ -4,6 +4,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Automation;
 using System.Windows.Forms;
 
@@ -40,29 +41,7 @@ internal static class TrayLauncher
     [StructLayout(LayoutKind.Sequential)] private struct MouseInput { public int X; public int Y; public uint Data; public uint Flags; public uint Time; public UIntPtr ExtraInfo; }
     [StructLayout(LayoutKind.Sequential)] private struct Input { public uint Type; public MouseInput Mouse; }
 
-    private static string Json(string value)
-    {
-        StringBuilder result = new StringBuilder("\"");
-        foreach (char character in value ?? "")
-        {
-            switch (character)
-            {
-                case '\"': result.Append("\\\""); break;
-                case '\\': result.Append("\\\\"); break;
-                case '\b': result.Append("\\b"); break;
-                case '\f': result.Append("\\f"); break;
-                case '\n': result.Append("\\n"); break;
-                case '\r': result.Append("\\r"); break;
-                case '\t': result.Append("\\t"); break;
-                default:
-                    if (character < 0x20 || character == 0x2028 || character == 0x2029 || Char.IsSurrogate(character))
-                        result.Append("\\u").Append(((int)character).ToString("x4"));
-                    else result.Append(character);
-                    break;
-            }
-        }
-        return result.Append('\"').ToString();
-    }
+    private static string Json(string value) { return new JavaScriptSerializer().Serialize(value ?? ""); }
 
     private static bool Matches(IntPtr window)
     {
@@ -111,25 +90,12 @@ internal static class TrayLauncher
         return null;
     }
 
-    private static AutomationElement FindMenuItem(System.Windows.Point origin)
+    private static AutomationElement FindMenuItem()
     {
-        Condition menus = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu);
-        Condition itemCondition = new AndCondition(
+        Condition condition = new AndCondition(
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
             new PropertyCondition(AutomationElement.NameProperty, TrayMenuItemName));
-        AutomationElement best = null;
-        double bestDistance = Double.MaxValue;
-        foreach (AutomationElement menu in AutomationElement.RootElement.FindAll(TreeScope.Descendants, menus))
-        {
-            AutomationElement item = menu.FindFirst(TreeScope.Descendants, itemCondition);
-            if (item == null || !item.Current.IsEnabled || item.Current.IsOffscreen) continue;
-            System.Windows.Rect rectangle = menu.Current.BoundingRectangle;
-            double dx = origin.X < rectangle.Left ? rectangle.Left-origin.X : (origin.X > rectangle.Right ? origin.X-rectangle.Right : 0);
-            double dy = origin.Y < rectangle.Top ? rectangle.Top-origin.Y : (origin.Y > rectangle.Bottom ? origin.Y-rectangle.Bottom : 0);
-            double distance = dx*dx + dy*dy;
-            if (distance < bestDistance) { best=item; bestDistance=distance; }
-        }
-        return best;
+        return AutomationElement.RootElement.FindFirst(TreeScope.Descendants, condition);
     }
 
     private static bool RightClick(int x, int y)
@@ -160,8 +126,8 @@ internal static class TrayLauncher
                     if (icon.TryGetClickablePoint(out point) && RightClick((int)point.X, (int)point.Y))
                     {
                         Thread.Sleep(RetryDelayMilliseconds);
-                        AutomationElement item = FindMenuItem(point);
-                        if (item != null)
+                        AutomationElement item = FindMenuItem();
+                        if (item != null && item.Current.IsEnabled)
                         {
                             object pattern;
                             if (item.TryGetCurrentPattern(InvokePattern.Pattern, out pattern))

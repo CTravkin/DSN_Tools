@@ -96,7 +96,7 @@ class RuntimeSettingsTests(unittest.TestCase):
     def test_environment_settings_are_parsed_without_local_identities(self) -> None:
         temporary = Path(tempfile.gettempdir())
         settings = module.parse_runtime_settings(
-            ["--scan"],
+            [],
             {
                 "ACL_USERS": "alice,bob",
                 "SYNCTHING_USER": "sync-service",
@@ -109,22 +109,13 @@ class RuntimeSettingsTests(unittest.TestCase):
         self.assertEqual("sync-service", settings.syncthing_user)
         self.assertEqual(temporary / "acl-state.sqlite3", settings.state_path)
         self.assertEqual(temporary / "folders.conf", settings.allowlist_path)
-        self.assertTrue(settings.scan)
 
     def test_cli_values_override_environment_values(self) -> None:
         settings = module.parse_runtime_settings(
-            ["--users", "carol,dave", "--refresh-hours", "6"],
-            runtime_environment(ACL_USERS="alice,bob", REFRESH_HOURS="3"),
+            ["--users", "carol,dave"],
+            runtime_environment(ACL_USERS="alice,bob"),
         )
         self.assertEqual(("carol", "dave"), settings.acl_users)
-        self.assertEqual(6, settings.refresh_hours)
-
-    def test_cli_interval_overrides_an_invalid_environment_value(self) -> None:
-        settings = module.parse_runtime_settings(
-            ["--users", "carol", "--refresh-hours", "6"],
-            runtime_environment(REFRESH_HOURS="not-an-integer"),
-        )
-        self.assertEqual(6, settings.refresh_hours)
 
     def test_empty_managed_user_list_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "managed ACL user"):
@@ -145,33 +136,34 @@ class RuntimeSettingsTests(unittest.TestCase):
             )
 
             settings = module.parse_runtime_settings(
-                ["--env-file", os.fspath(env_file), "--scan"],
+                ["--env-file", os.fspath(env_file)],
                 {},
             )
 
         self.assertEqual(("alice",), settings.acl_users)
         self.assertEqual(Path(temporary) / "folders.conf", settings.allowlist_path)
-        self.assertTrue(settings.scan)
 
 
-@unittest.skipUnless(os.name == "posix", "folder allowlist paths use POSIX semantics")
 class FolderAllowlistTests(unittest.TestCase):
-    def test_only_exact_folder_id_and_path_pairs_are_accepted(self) -> None:
-        allowlist = module.parse_folder_allowlist("documents=/srv/sync/documents\n")
-        configured = [module.FolderConfiguration("documents", Path("/srv/sync/documents"))]
+    def test_allowlist_selects_a_subset_of_configured_folders(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            managed = module.FolderConfiguration("managed", base / "managed")
+            unrelated = module.FolderConfiguration("unrelated", base / "unrelated")
+            allowlist = module.parse_folder_allowlist(f"managed={managed.path}\n")
 
-        self.assertEqual(configured, module.require_allowed_folders(configured, allowlist))
-
-        with self.assertRaisesRegex(ValueError, "not allowlisted"):
-            module.require_allowed_folders(
-                [module.FolderConfiguration("documents", Path("/etc"))],
-                allowlist,
+            self.assertEqual(
+                [managed], module.require_allowed_folders([managed, unrelated], allowlist)
             )
 
-    def test_system_roots_are_rejected_even_when_listed(self) -> None:
-        for path in ("/", "/etc", "/usr/local", "/proc/1"):
-            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "system path"):
-                module.parse_folder_allowlist(f"folder={path}\n")
+    @unittest.skipUnless(os.name == "posix", "root-path check uses POSIX semantics")
+    def test_only_the_filesystem_root_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "filesystem root"):
+            module.parse_folder_allowlist("folder=/\n")
+        self.assertEqual(
+            {"folder": Path("/var/lib/syncthing/data")},
+            module.parse_folder_allowlist("folder=/var/lib/syncthing/data\n"),
+        )
 
 
 class IgnoreMatcherTests(unittest.TestCase):
@@ -684,50 +676,6 @@ class AclReconciliationTests(unittest.TestCase):
                 with self.assertRaises(module.UnsafePathError):
                     managed_root.open_target(root / "escape" / "target")
 
-    def test_final_symlink_keeps_managed_revoke_state(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            root = base / "root"
-            root.mkdir()
-            path = root / "file"
-            path.write_text("data", encoding="utf-8")
-            state = module.StateStore(base / "state.sqlite3")
-            module.reconcile_path(path, module.AccessLevel.FULL, state, force=True, allowed_roots=[root])
-            moved = root / "moved"
-            path.rename(moved)
-            path.symlink_to(moved.name)
-
-            stats = module.reconcile_path(
-                path, module.AccessLevel.FULL, state, force=True, allowed_roots=[root]
-            )
-
-            self.assertEqual(1, stats.failed)
-            self.assertIsNotNone(state.get(path))
-            state.close()
-
-    def test_replaced_inode_is_not_granted_or_used_for_revoke(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            base = Path(temporary)
-            root = base / "root"
-            root.mkdir()
-            path = root / "file"
-            path.write_text("original", encoding="utf-8")
-            state = module.StateStore(base / "state.sqlite3")
-            module.reconcile_path(path, module.AccessLevel.FULL, state, force=True, allowed_roots=[root])
-            previous = state.get(path)
-            path.rename(base / "moved")
-            path.write_text("replacement", encoding="utf-8")
-
-            with mock.patch.object(module, "set_managed_access") as set_access:
-                stats = module.reconcile_path(
-                    path, module.AccessLevel.NONE, state, force=True, allowed_roots=[root]
-                )
-
-            self.assertEqual(1, stats.failed)
-            self.assertEqual(previous, state.get(path))
-            set_access.assert_not_called()
-            state.close()
-
     def test_failed_acl_read_is_not_cached_and_next_pass_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -772,7 +720,7 @@ class AclReconciliationTests(unittest.TestCase):
             self.assertEqual(second.acl_reads, 0)
             self.assertEqual(second.changed, 0)
 
-    def test_replaced_former_root_is_reported_once_and_retained_for_manual_recovery(self) -> None:
+    def test_replaced_former_root_is_reported_once_and_removed_from_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             root = base / "folder"
@@ -798,7 +746,7 @@ class AclReconciliationTests(unittest.TestCase):
                 if "Former managed root identity changed" in str(call)
             ]
             self.assertEqual(len(warnings), 1)
-            self.assertEqual(len(list(state.iter_items())), 41)
+            self.assertEqual(len(list(state.iter_items())), 0)
 
 
 class StateMigrationTests(unittest.TestCase):
@@ -809,7 +757,6 @@ class StateMigrationTests(unittest.TestCase):
             anchor = Path(temporary) / "folder"
             anchor.mkdir()
             managed_path.write_text("data", encoding="utf-8")
-            metadata = managed_path.stat()
             connection = module.sqlite3.connect(path)
             connection.execute(
                 "CREATE TABLE paths (path TEXT PRIMARY KEY, ctime_ns INTEGER NOT NULL, "
@@ -822,56 +769,19 @@ class StateMigrationTests(unittest.TestCase):
             )
             connection.commit()
             connection.close()
-            previous_users = module.LEGACY_ACL_USERS
-            module.LEGACY_ACL_USERS = ("old-user",)
+            previous_users = module.ACL_USERS
+            module.ACL_USERS = ("current-user",)
             try:
                 state = module.StateStore(path)
                 record = state.get(managed_path)
                 state.close()
             finally:
-                module.LEGACY_ACL_USERS = previous_users
+                module.ACL_USERS = previous_users
 
         self.assertIsNotNone(record)
         assert record is not None
         self.assertEqual(module.AccessLevel.FULL, record.access)
-        self.assertEqual(("old-user",), record.users)
-        self.assertEqual(
-            (module.sqlite_identity(metadata.st_dev), module.sqlite_identity(metadata.st_ino)),
-            (record.target_dev, record.target_ino),
-        )
-
-    def test_legacy_managed_state_requires_explicit_previous_users(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "state.sqlite3"
-            managed_path = Path(temporary) / "file"
-            managed_path.write_text("data", encoding="utf-8")
-            connection = module.sqlite3.connect(path)
-            connection.execute(
-                "CREATE TABLE paths (path TEXT PRIMARY KEY, ctime_ns INTEGER NOT NULL, "
-                "desired INTEGER NOT NULL, anchor TEXT NOT NULL, anchor_dev INTEGER NOT NULL, "
-                "anchor_ino INTEGER NOT NULL)"
-            )
-            connection.execute(
-                "INSERT INTO paths VALUES (?, ?, ?, ?, ?, ?)",
-                (os.fspath(managed_path), 123, 1, os.fspath(Path(temporary)), 10, 20),
-            )
-            connection.commit()
-            connection.close()
-            previous_users = module.LEGACY_ACL_USERS
-            module.LEGACY_ACL_USERS = ()
-            try:
-                with self.assertRaisesRegex(ValueError, "LEGACY_ACL_USERS"):
-                    module.StateStore(path)
-            finally:
-                module.LEGACY_ACL_USERS = previous_users
-
-    def test_managed_record_detects_replaced_inode(self) -> None:
-        record = module.StateRecord(
-            1, module.AccessLevel.FULL, Path("/managed"), 1, 2, 3, 4, ("alice",), False
-        )
-        self.assertTrue(module.record_has_managed_acl(record))
-        self.assertTrue(module.target_identity_changed(record, 3, 5))
-        self.assertFalse(module.target_identity_changed(record, 3, 4))
+        self.assertEqual(("current-user",), record.users)
 
     def test_unknown_state_schema_is_rejected_without_dropping_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -892,11 +802,7 @@ class StateMigrationTests(unittest.TestCase):
         self.assertEqual(("sentinel", "keep"), row)
 
 
-class EventReliabilityTests(unittest.TestCase):
-    def test_folder_events_are_blocked_while_policy_reload_is_pending(self) -> None:
-        self.assertFalse(module.folder_event_reconciliation_allowed(policy_dirty=True))
-        self.assertTrue(module.folder_event_reconciliation_allowed(policy_dirty=False))
-
+class WalkReliabilityTests(unittest.TestCase):
     def test_walk_error_marks_reconciliation_failed(self) -> None:
         stats = module.ReconcileStats()
 
@@ -910,37 +816,18 @@ class EventReliabilityTests(unittest.TestCase):
 
         self.assertEqual(1, stats.failed)
 
-    def test_queue_overflow_requires_full_reconciliation(self) -> None:
-        self.assertTrue(module.events_require_full_reconciliation({"Q_OVERFLOW"}))
+class MainTests(unittest.TestCase):
+    def test_default_invocation_runs_one_scan(self) -> None:
+        settings = types.SimpleNamespace(revoke_all=False, force=False)
+        with mock.patch.object(module, "parse_runtime_settings", return_value=settings), mock.patch.object(
+            module, "apply_runtime_settings"
+        ), mock.patch.object(module.pwd, "getpwnam"), mock.patch.object(
+            module, "scan_once", return_value=0
+        ) as scan:
+            exit_code = module.main()
 
-    def test_retry_backoff_retries_without_new_event_and_resets_after_success(self) -> None:
-        retry = module.RetryBackoff(initial_seconds=5, maximum_seconds=20)
-        retry.failed(now=100)
-        self.assertFalse(retry.is_due(now=104.9))
-        self.assertTrue(retry.is_due(now=105))
-        retry.failed(now=105)
-        self.assertTrue(retry.is_due(now=115))
-        retry.succeeded()
-        self.assertIsNone(retry.due_at)
-        retry.failed(now=200)
-        self.assertTrue(retry.is_due(now=205))
-
-    def test_failed_reconciliation_is_scheduled_for_retry(self) -> None:
-        retry = module.RetryBackoff(initial_seconds=5, maximum_seconds=20)
-
-        still_dirty = module.record_reconciliation_result(
-            module.ReconcileStats(failed=1), retry, now=100
-        )
-
-        self.assertTrue(still_dirty)
-        self.assertTrue(retry.is_due(now=105))
-        self.assertFalse(retry.is_due(now=104.9))
-
-        clean = module.record_reconciliation_result(
-            module.ReconcileStats(), retry, now=105
-        )
-        self.assertFalse(clean)
-        self.assertIsNone(retry.due_at)
+        self.assertEqual(0, exit_code)
+        scan.assert_called_once_with(False)
 
 
 if __name__ == "__main__":
