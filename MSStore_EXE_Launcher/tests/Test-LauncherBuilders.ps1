@@ -42,6 +42,7 @@ try {
     Import-Module (Join-Path $utilityRoot 'Common\BuildHelpers.psm1') -Force
 
     Assert-Equal '"a\\b\"c"' (ConvertTo-CSharpLiteral 'a\b"c') 'C# literal escaping is unsafe'
+    Assert-Equal '"a\u2028b"' (ConvertTo-CSharpLiteral "a$([char]0x2028)b") 'C# line separator must be escaped'
     $catalog = @(
         [pscustomobject]@{ Name='Duplicate'; AppID='Package.One!App' },
         [pscustomobject]@{ Name='Duplicate'; AppID='Package.Two!App' }
@@ -57,14 +58,30 @@ try {
     $storeOutput = Join-Path $testRoot 'Store Fixture.exe'
     & (Join-Path $utilityRoot 'Build-Launcher.ps1') -AppId 'Example.Package_123!App' -OutputPath $storeOutput
     Assert-Equal 'Example.Package_123!App' (Invoke-Diagnostic $storeOutput '--print-aumid') 'Store AUMID was not embedded'
+    try {
+        & (Join-Path $utilityRoot 'Build-Launcher.ps1') -AppId 'Example.Package_123!App' -OutputPath $storeOutput
+        throw 'Existing output was overwritten without -Force'
+    }
+    catch {
+        if ($_.Exception.Message -notmatch 'already exists') { throw }
+    }
+    & (Join-Path $utilityRoot 'Build-Launcher.ps1') -AppId 'Example.Package_123!App' -OutputPath $storeOutput -Force
+    try {
+        & (Join-Path $utilityRoot 'Build-Launcher.ps1') -AppId 'not-an-aumid' -OutputPath (Join-Path $testRoot 'Invalid.exe')
+        throw 'Invalid AUMID was accepted'
+    }
+    catch {
+        if ($_.Exception.Message -notmatch 'valid.*AUMID') { throw }
+    }
 
     $target = Join-Path $testRoot 'fixture target.exe'
     Set-Content -LiteralPath $target -Value 'fixture'
     $desktopOutput = Join-Path $testRoot 'Desktop Fixture.exe'
-    & (Join-Path $utilityRoot 'Extras\Desktop_EXE_Launcher\Build-DesktopLauncher.ps1') -TargetPath $target -Arguments '--profile "Test User"' -ProcessName 'FixtureProcess' -WindowClass 'FixtureWindow' -OutputPath $desktopOutput
+    $desktopArguments = "--profile `"Test User`"`n__VALUE__"
+    & (Join-Path $utilityRoot 'Extras\Desktop_EXE_Launcher\Build-DesktopLauncher.ps1') -TargetPath $target -Arguments $desktopArguments -ProcessName 'FixtureProcess' -WindowClass 'FixtureWindow' -OutputPath $desktopOutput
     $desktopConfig = Invoke-Diagnostic $desktopOutput '--print-config' | ConvertFrom-Json
     Assert-Equal $target $desktopConfig.targetPath 'Desktop target was not embedded'
-    Assert-Equal '--profile "Test User"' $desktopConfig.arguments 'Desktop arguments were not embedded'
+    Assert-Equal $desktopArguments $desktopConfig.arguments 'Desktop arguments were not embedded or JSON-escaped correctly'
     Assert-Equal 'FixtureProcess' $desktopConfig.processName 'Desktop process was not embedded'
     Assert-Equal 'FixtureWindow' $desktopConfig.windowClass 'Desktop window class was not embedded'
 

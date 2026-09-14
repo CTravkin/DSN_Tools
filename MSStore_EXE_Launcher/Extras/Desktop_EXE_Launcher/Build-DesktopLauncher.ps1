@@ -7,7 +7,8 @@ param(
     [string]$WindowClass = '',
     [string]$WindowTitle = '',
     [switch]$IncludeHiddenWindow,
-    [string]$IconPath
+    [string]$IconPath,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,5 +21,5 @@ $replacement = @{
     TARGET_PATH=(ConvertTo-CSharpLiteral $TargetPath); ARGUMENTS=(ConvertTo-CSharpLiteral $Arguments); PROCESS_NAME=(ConvertTo-CSharpLiteral $process)
     WINDOW_CLASS=(ConvertTo-CSharpLiteral $WindowClass); WINDOW_TITLE=(ConvertTo-CSharpLiteral $WindowTitle); INCLUDE_HIDDEN=$(if($IncludeHiddenWindow){'true'}else{'false'})
 }
-$result = Invoke-TemplateLauncherBuild -TemplatePath (Join-Path $PSScriptRoot 'DesktopLauncher.cs.template') -OutputPath $OutputPath -Replacement $replacement -Reference @('System.Windows.Forms.dll') -IconPath $IconPath
+$result = Invoke-TemplateLauncherBuild -TemplatePath (Join-Path $PSScriptRoot 'DesktopLauncher.cs.template') -OutputPath $OutputPath -Replacement $replacement -Reference @('System.Windows.Forms.dll') -IconPath $IconPath -Force:$Force
 Write-Output "Built desktop launcher: $result"

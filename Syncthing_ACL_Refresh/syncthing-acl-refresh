@@ -30,11 +30,13 @@ from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
 SYNCTHING_USER = "syncthing"
 ACL_USERS: tuple[str, ...] = ()
+LEGACY_ACL_USERS: tuple[str, ...] = ()
 FULL_REFRESH_HOURS = 3
 MISSING_FOLDER_RECHECK_SECONDS = 60
 STATE_PATH = Path("/var/lib/syncthing-acl-refresh/state.sqlite3")
 PINNED_CERTIFICATE_PATH = Path("/etc/syncthing-acl-refresh/https-cert.pem")
 CONFIG_PATH: Path | None = None
+ALLOWLIST_PATH = Path("/etc/syncthing-acl-refresh/folders.conf")
 INOTIFY_EVENTS = (
     "attrib", "create", "moved_to", "close_write", "delete", "delete_self", "move_self"
 )
@@ -45,13 +47,16 @@ PERMISSION_BITS = {"r": 4, "w": 2, "x": 1}
 class RuntimeSettings:
     syncthing_user: str
     acl_users: tuple[str, ...]
+    legacy_acl_users: tuple[str, ...]
     config_path: Path | None
     state_path: Path
     certificate_path: Path
+    allowlist_path: Path
     refresh_hours: int
     missing_recheck_seconds: int
     scan: bool
     force: bool
+    revoke_all: bool
 
 
 def _absolute_path(value: str, variable: str) -> Path:
@@ -76,21 +81,48 @@ def _managed_users(value: str) -> tuple[str, ...]:
     return tuple(users)
 
 
+def read_environment_file(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, separator, value = line.partition("=")
+        name = name.strip()
+        if not separator or not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+            raise ValueError(f"Invalid environment entry at {path}:{line_number}")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        values[name] = value
+    return values
+
+
 def parse_runtime_settings(
     arguments: Sequence[str] | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> RuntimeSettings:
-    env = os.environ if environment is None else environment
+    source_env = os.environ if environment is None else environment
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--env-file")
+    pre_parsed, _unknown = pre_parser.parse_known_args(arguments)
+    env = dict(source_env)
+    if pre_parsed.env_file:
+        env.update(read_environment_file(_absolute_path(pre_parsed.env_file, "env-file")))
     parser = argparse.ArgumentParser(description="Reconcile POSIX ACLs with Syncthing folder policy")
+    parser.add_argument("--env-file", help="load KEY=VALUE settings for a direct invocation")
     parser.add_argument("--syncthing-user", default=env.get("SYNCTHING_USER", "syncthing"))
     parser.add_argument("--users", default=env.get("ACL_USERS", ""))
+    parser.add_argument("--legacy-users", default=env.get("LEGACY_ACL_USERS", ""))
     parser.add_argument("--config", default=env.get("SYNCTHING_CONFIG", ""))
     parser.add_argument("--state", default=env.get("STATE_PATH", "/var/lib/syncthing-acl-refresh/state.sqlite3"))
     parser.add_argument("--certificate", default=env.get("TLS_CERTIFICATE", "/etc/syncthing-acl-refresh/https-cert.pem"))
+    parser.add_argument("--allowlist", default=env.get("FOLDER_ALLOWLIST", "/etc/syncthing-acl-refresh/folders.conf"))
     parser.add_argument("--refresh-hours", type=int, default=env.get("REFRESH_HOURS", "3"))
     parser.add_argument("--missing-recheck-seconds", type=int, default=env.get("MISSING_RECHECK_SECONDS", "60"))
     parser.add_argument("--scan", action="store_true", help="run one reconciliation and exit")
     parser.add_argument("--force", action="store_true", help="inspect ACLs even when cached metadata is unchanged")
+    parser.add_argument("--revoke-all", action="store_true", help="remove ACL entries recorded in state and exit")
     parsed = parser.parse_args(arguments)
 
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*\$?", parsed.syncthing_user):
@@ -102,24 +134,29 @@ def parse_runtime_settings(
     return RuntimeSettings(
         syncthing_user=parsed.syncthing_user,
         acl_users=_managed_users(parsed.users),
+        legacy_acl_users=_managed_users(parsed.legacy_users) if parsed.legacy_users.strip() else (),
         config_path=_absolute_path(parsed.config, "config") if parsed.config else None,
         state_path=_absolute_path(parsed.state, "state"),
         certificate_path=_absolute_path(parsed.certificate, "certificate"),
+        allowlist_path=_absolute_path(parsed.allowlist, "allowlist"),
         refresh_hours=parsed.refresh_hours,
         missing_recheck_seconds=parsed.missing_recheck_seconds,
         scan=parsed.scan,
         force=parsed.force,
+        revoke_all=parsed.revoke_all,
     )
 
 
 def apply_runtime_settings(settings: RuntimeSettings) -> None:
-    global SYNCTHING_USER, ACL_USERS, CONFIG_PATH, STATE_PATH
+    global SYNCTHING_USER, ACL_USERS, LEGACY_ACL_USERS, CONFIG_PATH, STATE_PATH, ALLOWLIST_PATH
     global PINNED_CERTIFICATE_PATH, FULL_REFRESH_HOURS, MISSING_FOLDER_RECHECK_SECONDS
     SYNCTHING_USER = settings.syncthing_user
     ACL_USERS = settings.acl_users
+    LEGACY_ACL_USERS = settings.legacy_acl_users
     CONFIG_PATH = settings.config_path
     STATE_PATH = settings.state_path
     PINNED_CERTIFICATE_PATH = settings.certificate_path
+    ALLOWLIST_PATH = settings.allowlist_path
     FULL_REFRESH_HOURS = settings.refresh_hours
     MISSING_FOLDER_RECHECK_SECONDS = settings.missing_recheck_seconds
 
@@ -137,6 +174,12 @@ class AclOutcome(Enum):
     CHANGED = auto()
     FAILED = auto()
     GONE = auto()
+
+
+class AccessLevel(Enum):
+    NONE = 0
+    TRAVERSE = 1
+    FULL = 2
 
 
 def log(message: str) -> None:
@@ -192,6 +235,105 @@ class FolderConfiguration:
     path: Path
 
 
+SYSTEM_PATHS = tuple(
+    Path(item)
+    for item in (
+        "/bin",
+        "/boot",
+        "/dev",
+        "/etc",
+        "/lib",
+        "/lib64",
+        "/proc",
+        "/root",
+        "/run",
+        "/sbin",
+        "/sys",
+        "/usr",
+        "/var",
+    )
+)
+
+
+def parse_folder_allowlist(text: str) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    for line_number, raw_line in enumerate(text.splitlines(), 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        folder_id, separator, raw_path = line.partition("=")
+        folder_id, raw_path = folder_id.strip(), raw_path.strip()
+        if not separator or not re.fullmatch(r"[A-Za-z0-9._-]+", folder_id) or not raw_path:
+            raise ValueError(f"Invalid folder allowlist entry at line {line_number}")
+        path = Path(os.path.abspath(raw_path))
+        if not Path(raw_path).is_absolute():
+            raise ValueError(f"Allowlisted folder path must be absolute: {raw_path}")
+        if path == Path("/") or any(path == system or path.is_relative_to(system) for system in SYSTEM_PATHS):
+            raise ValueError(f"Refusing system path in folder allowlist: {path}")
+        if folder_id in result:
+            raise ValueError(f"Duplicate folder ID in allowlist: {folder_id}")
+        result[folder_id] = path
+    if not result:
+        raise ValueError("Folder allowlist must contain at least one folder")
+    return result
+
+
+def load_folder_allowlist(path: Path) -> dict[str, Path]:
+    path = Path(os.path.abspath(path))
+    parent_fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for component in path.parent.parts[1:]:
+            next_fd = os.open(
+                component,
+                os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent_fd,
+            )
+            os.close(parent_fd)
+            parent_fd = next_fd
+            metadata = os.fstat(parent_fd)
+            if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                raise ValueError(
+                    f"Folder allowlist parent must be root-owned and not writable by group or others: {path.parent}"
+                )
+        file_fd = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+            dir_fd=parent_fd,
+        )
+        try:
+            metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError(f"Folder allowlist must be a regular file: {path}")
+            if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                raise ValueError(
+                    "Folder allowlist must be owned by root and not writable by group or others"
+                )
+            with os.fdopen(file_fd, "r", encoding="utf-8") as source:
+                file_fd = -1
+                return parse_folder_allowlist(source.read())
+        finally:
+            if file_fd >= 0:
+                os.close(file_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def require_allowed_folders(
+    folders: list[FolderConfiguration], allowlist: Mapping[str, Path]
+) -> list[FolderConfiguration]:
+    configured = {folder.folder_id: folder for folder in folders}
+    for folder_id, folder in configured.items():
+        expected = allowlist.get(folder_id)
+        if expected is None or folder.path != expected:
+            raise ValueError(
+                f"Syncthing folder is not allowlisted with its exact path: {folder_id}={folder.path}"
+            )
+    missing = sorted(set(allowlist) - set(configured))
+    if missing:
+        raise ValueError("Allowlisted Syncthing folders are missing from configuration: " + ", ".join(missing))
+    return sorted(configured.values(), key=lambda item: (len(item.path.parts), os.fspath(item.path)))
+
+
 def normalize_gui_https(address: str, use_tls: bool) -> str:
     if not use_tls:
         raise ValueError("Syncthing GUI must enforce HTTPS for the root helper")
@@ -222,6 +364,8 @@ def read_configuration(config_path: Path, home: Path) -> tuple[GuiConfiguration,
             folder_id = element.attrib.get("id", "").strip()
             raw_path = element.attrib.get("path", "").strip()
             if folder_id and raw_path:
+                if folder_id in folders:
+                    raise ValueError(f"Duplicate Syncthing folder ID: {folder_id}")
                 folders[folder_id] = FolderConfiguration(folder_id, resolve_folder_path(raw_path, home))
     if gui_element is None:
         raise ValueError("Syncthing GUI configuration is missing")
@@ -409,12 +553,19 @@ def literal_prefix(pattern: str) -> tuple[str, bool]:
     return "/".join(components), subtree
 
 
-def discover_control_paths(root: Path) -> set[str]:
+@dataclass(frozen=True)
+class ControlPaths:
+    files: set[str]
+    parents: set[str]
+
+
+def discover_control_paths(root: Path) -> ControlPaths:
     root = root.resolve()
-    result = {".stignore", ".stfolder"}
+    files = {".stignore", ".stfolder"}
+    parents: set[str] = set()
     first = root / ".stignore"
     if not first.is_file():
-        return result
+        return ControlPaths(files, parents)
     visited: set[Path] = set()
 
     def visit(path: Path) -> None:
@@ -429,10 +580,10 @@ def discover_control_paths(root: Path) -> set[str]:
         except ValueError as error:
             raise ValueError(f"Syncthing ignore include escapes the folder root: {path}") from error
         for control_relative in {logical_relative, relative}:
-            result.add(control_relative.as_posix())
+            files.add(control_relative.as_posix())
             for parent in control_relative.parents:
                 if parent != Path("."):
-                    result.add(parent.as_posix())
+                    parents.add(parent.as_posix())
         if resolved in visited:
             return
         visited.add(resolved)
@@ -444,17 +595,19 @@ def discover_control_paths(root: Path) -> set[str]:
                     visit(logical.parent / include_name)
 
     visit(first)
-    return result
+    return ControlPaths(files, parents)
 
 
 class IgnoreMatcher:
     def __init__(
         self,
         expanded_patterns: Iterable[str],
-        control_paths: Iterable[str] = (".stignore", ".stfolder"),
+        control_files: Iterable[str] = (".stignore", ".stfolder"),
+        control_parents: Iterable[str] = (),
     ) -> None:
         self.patterns: list[CompiledIgnorePattern] = []
-        self.control_paths = set(control_paths)
+        self.control_files = set(control_files)
+        self.control_parents = set(control_parents)
         self.traversal_rules: list[TraversalRule] = []
         for raw in expanded_patterns:
             pattern, case_insensitive, negated = strip_pattern_prefixes(raw.strip())
@@ -503,30 +656,35 @@ class IgnoreMatcher:
         return True if match is None else match[1].negated
 
     def is_control_path(self, relative_path: str) -> bool:
-        return relative_path.replace(os.sep, "/").strip("/") in self.control_paths
+        return relative_path.replace(os.sep, "/").strip("/") in self.control_files
 
-    def directory_requires_access(self, relative_path: str) -> bool:
+    def directory_access(self, relative_path: str) -> AccessLevel:
         normalized = relative_path.replace(os.sep, "/").strip("/")
-        if not normalized or self.is_control_path(normalized):
-            return True
-        if any(item.startswith(normalized + "/") for item in self.control_paths):
-            return True
+        if not normalized:
+            return AccessLevel.FULL
+        if self.is_control_path(normalized):
+            return AccessLevel.NONE
         match = self.first_match(normalized)
-        if match is None or match[1].negated:
-            return True
-        ignore_index = match[0]
-        for rule in self.traversal_rules:
-            if rule.pattern_index >= ignore_index:
-                continue
-            if rule.prefix is None:
-                return True
-            candidate = normalized.casefold() if rule.case_insensitive else normalized
-            prefix = rule.prefix.casefold() if rule.case_insensitive else rule.prefix
-            if prefix == candidate or prefix.startswith(candidate + "/"):
-                return True
-            if rule.subtree and candidate.startswith(prefix + "/"):
-                return True
-        return False
+        policy_access = AccessLevel.FULL if match is None or match[1].negated else AccessLevel.NONE
+        if match is not None and not match[1].negated:
+            ignore_index = match[0]
+            for rule in self.traversal_rules:
+                if rule.pattern_index >= ignore_index:
+                    continue
+                if rule.prefix is None:
+                    policy_access = AccessLevel.TRAVERSE
+                    break
+                candidate = normalized.casefold() if rule.case_insensitive else normalized
+                prefix = rule.prefix.casefold() if rule.case_insensitive else rule.prefix
+                if prefix == candidate or prefix.startswith(candidate + "/"):
+                    policy_access = AccessLevel.TRAVERSE
+                    break
+                if rule.subtree and candidate.startswith(prefix + "/"):
+                    policy_access = AccessLevel.TRAVERSE
+                    break
+        if normalized in self.control_parents:
+            return max(policy_access, AccessLevel.TRAVERSE, key=lambda item: item.value)
+        return policy_access
 
 
 def read_ignore_matcher(gui: GuiConfiguration, folder_id: str, root: Path) -> IgnoreMatcher:
@@ -536,9 +694,8 @@ def read_ignore_matcher(gui: GuiConfiguration, folder_id: str, root: Path) -> Ig
     raw, expanded = payload.get("ignore") or [], payload.get("expanded") or []
     if not isinstance(raw, list) or not isinstance(expanded, list):
         raise ValueError(f"Invalid ignore response for folder {folder_id}")
-    return IgnoreMatcher(
-        [str(item) for item in expanded], discover_control_paths(root)
-    )
+    controls = discover_control_paths(root)
+    return IgnoreMatcher([str(item) for item in expanded], controls.files, controls.parents)
 
 
 @dataclass(frozen=True)
@@ -550,6 +707,7 @@ class FolderPolicy:
 
 def load_policies(config_path: Path, home: Path) -> list[FolderPolicy]:
     gui, folders = read_configuration(config_path, home)
+    folders = require_allowed_folders(folders, load_folder_allowlist(ALLOWLIST_PATH))
     return [
         FolderPolicy(folder.folder_id, folder.path, read_ignore_matcher(gui, folder.folder_id, folder.path))
         for folder in folders
@@ -559,6 +717,8 @@ def load_policies(config_path: Path, home: Path) -> list[FolderPolicy]:
 class ManagedTarget:
     def __init__(self, fd: int, display_path: Path, mode: int) -> None:
         self.fd, self.display_path, self.mode = fd, display_path, mode
+        self.created_default_acl = False
+        self.default_acl_cleared = False
 
     @property
     def proc_path(self) -> str:
@@ -576,23 +736,50 @@ class ManagedTarget:
         self.close()
 
 
+def fd_mount_id(fd: int) -> int:
+    with open(f"/proc/self/fdinfo/{fd}", encoding="ascii") as information:
+        for line in information:
+            if line.startswith("mnt_id:"):
+                return int(line.partition(":")[2].strip())
+    raise UnsafePathError("Kernel did not expose a mount ID for an opened path")
+
+
 class ManagedRoot:
     def __init__(self, path: Path) -> None:
         self.path = Path(os.path.abspath(path))
         self.fd = -1
         self.resolved = Path()
         self.device = self.inode = 0
+        self.mount_id = 0
 
     def __enter__(self) -> "ManagedRoot":
-        self.fd = os.open(self.path, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        metadata = os.fstat(self.fd)
-        self.device, self.inode = metadata.st_dev, metadata.st_ino
-        rendered = os.readlink(f"/proc/self/fd/{self.fd}")
-        if rendered.endswith(" (deleted)"):
+        current_fd = os.open("/", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            for component in self.path.parts[1:]:
+                next_fd = os.open(
+                    component,
+                    os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=current_fd,
+                )
+                os.close(current_fd)
+                current_fd = next_fd
+            self.fd = current_fd
+            current_fd = -1
+            metadata = os.fstat(self.fd)
+            self.device, self.inode = metadata.st_dev, metadata.st_ino
+            self.mount_id = fd_mount_id(self.fd)
+            rendered = os.readlink(f"/proc/self/fd/{self.fd}")
+            if rendered.endswith(" (deleted)"):
+                raise UnsafePathError(f"Managed root disappeared while opening: {self.path}")
+            self.resolved = Path(rendered)
+            if self.resolved != self.path:
+                raise UnsafePathError(f"Managed root contains a symbolic link: {self.path}")
+            return self
+        except BaseException:
+            if current_fd >= 0:
+                os.close(current_fd)
             self.close()
-            raise UnsafePathError(f"Managed root disappeared while opening: {self.path}")
-        self.resolved = Path(rendered)
-        return self
+            raise
 
     def close(self) -> None:
         if self.fd >= 0:
@@ -608,13 +795,18 @@ class ManagedRoot:
             relative = path.relative_to(self.path)
         except ValueError as error:
             raise UnsafePathError(f"Path is outside managed root: {path}") from error
-        fd = os.open(
-            os.fspath(relative) if relative.parts else ".",
-            os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
-            dir_fd=self.fd,
-        )
+        fd = os.dup(self.fd)
         try:
+            for index, component in enumerate(relative.parts):
+                flags = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+                if index < len(relative.parts) - 1:
+                    flags |= os.O_DIRECTORY
+                next_fd = os.open(component, flags, dir_fd=fd)
+                os.close(fd)
+                fd = next_fd
             metadata = os.fstat(fd)
+            if fd_mount_id(fd) != self.mount_id or metadata.st_dev != self.device:
+                raise UnsafePathError(f"Path crosses a mount boundary below managed root: {path}")
             rendered = os.readlink(f"/proc/self/fd/{fd}")
             if rendered.endswith(" (deleted)"):
                 raise FileNotFoundError(path)
@@ -699,31 +891,61 @@ def has_unmanaged_execute(entries: dict[str, int], mask: int) -> bool:
     )
 
 
-def _set_managed_target_access(target: ManagedTarget, should_have_access: bool) -> AclOutcome:
+def _set_managed_target_access(
+    target: ManagedTarget,
+    access: AccessLevel,
+    previous_users: Iterable[str] = (),
+    created_default_acl: bool = False,
+) -> AclOutcome:
     try:
         entries = acl_entries(target)
         directory, regular = stat.S_ISDIR(target.mode), stat.S_ISREG(target.mode)
-        if not (should_have_access and (directory or regular)):
-            removals: list[str] = []
-            for user in ACL_USERS:
-                if f"user:{user}:" in entries:
-                    removals.append(f"u:{user}")
-                if directory and f"default:user:{user}:" in entries:
-                    removals.append(f"d:u:{user}")
-            if not removals:
-                return AclOutcome.UNCHANGED
+        if not (directory or regular):
+            access = AccessLevel.NONE
+        if access is AccessLevel.TRAVERSE and not directory:
+            access = AccessLevel.NONE
+
+        current_users = set(ACL_USERS)
+        removable_users = current_users | set(previous_users)
+        removals: list[str] = []
+        for user in removable_users:
+            if (access is AccessLevel.NONE or user not in current_users) and f"user:{user}:" in entries:
+                removals.append(f"u:{user}")
+            if directory and (access is not AccessLevel.FULL or user not in current_users) and f"default:user:{user}:" in entries:
+                removals.append(f"d:u:{user}")
+        changed = bool(removals)
+        if removals:
             run_setfacl(target, ["-n", "-x", ",".join(removals)])
-            log(f"Managed ACL removed: {target.display_path}")
-            return AclOutcome.CHANGED
+            entries = acl_entries(target)
+
+        if access is AccessLevel.NONE:
+            if directory and created_default_acl:
+                remaining_default_named = any(
+                    key.startswith("default:user:") and key != "default:user::"
+                    or key.startswith("default:group:") and key != "default:group::"
+                    for key in entries
+                )
+                if not remaining_default_named and "default:user::" in entries:
+                    run_setfacl(target, ["-k"])
+                    target.default_acl_cleared = True
+                    changed = True
+            if changed:
+                log(f"Managed ACL removed: {target.display_path}")
+                return AclOutcome.CHANGED
+            return AclOutcome.UNCHANGED
 
         old_mask = entries.get("mask::", entries.get("group::", 0))
-        desired_access = 7 if directory or has_unmanaged_execute(entries, old_mask) else 6
+        desired_access = (
+            1 if access is AccessLevel.TRAVERSE
+            else 7 if directory or has_unmanaged_execute(entries, old_mask)
+            else 6
+        )
         new_mask = old_mask | desired_access
         conflicts = unmanaged_mask_conflicts(entries, "", old_mask, new_mask)
         default_exists = "default:user::" in entries
         old_default_mask = entries.get("default:mask::", entries.get("default:group::", 0))
         new_default_mask = old_default_mask | 7
-        if directory and default_exists:
+        if directory and access is AccessLevel.FULL and default_exists:
             conflicts += unmanaged_mask_conflicts(entries, "default:", old_default_mask, new_default_mask)
         if conflicts:
             log(
@@ -736,18 +958,19 @@ def _set_managed_target_access(target: ManagedTarget, should_have_access: bool) 
             and (entries[f"user:{user}:"] & old_mask) == desired_access
             for user in ACL_USERS
         )
-        default_ok = not directory or default_exists and all(
+        default_ok = access is not AccessLevel.FULL or not directory or default_exists and all(
             entries.get(f"default:user:{user}:", 0) == 7
             and (entries[f"default:user:{user}:"] & old_default_mask) == 7
             for user in ACL_USERS
         )
         if access_ok and default_ok:
-            return AclOutcome.UNCHANGED
+            return AclOutcome.CHANGED if changed else AclOutcome.UNCHANGED
         specifications = [f"u:{user}:{permission_text(desired_access)}" for user in ACL_USERS]
         specifications.append(f"m::{permission_text(new_mask)}")
-        if directory:
+        if directory and access is AccessLevel.FULL:
             if not default_exists:
                 specifications.extend(("d:u::rwx", "d:g::---", "d:o::---"))
+                target.created_default_acl = True
             specifications.extend(f"d:u:{user}:rwx" for user in ACL_USERS)
             specifications.append(f"d:m::{permission_text(new_default_mask)}")
         run_setfacl(target, ["-n", "-m", ",".join(specifications)])
@@ -756,17 +979,28 @@ def _set_managed_target_access(target: ManagedTarget, should_have_access: bool) 
     except FileNotFoundError:
         return AclOutcome.GONE
     except (OSError, subprocess.CalledProcessError) as error:
-        log(f"ACL update failed for {target.display_path}: {error}")
+        detail = getattr(error, "stderr", "") or str(error)
+        log(f"ACL update failed for {target.display_path}: {str(detail).strip()}")
         return AclOutcome.FAILED
 
 
-def set_managed_access(target_or_path: ManagedTarget | Path, should_have_access: bool) -> AclOutcome:
+def set_managed_access(
+    target_or_path: ManagedTarget | Path,
+    should_have_access: bool | AccessLevel,
+    previous_users: Iterable[str] = (),
+    created_default_acl: bool = False,
+) -> AclOutcome:
+    access = (
+        should_have_access
+        if isinstance(should_have_access, AccessLevel)
+        else AccessLevel.FULL if should_have_access else AccessLevel.NONE
+    )
     if isinstance(target_or_path, ManagedTarget):
-        return _set_managed_target_access(target_or_path, should_have_access)
+        return _set_managed_target_access(target_or_path, access, previous_users, created_default_acl)
     path = Path(target_or_path)
     try:
         with ManagedRoot(path.parent) as root, root.open_target(path) as target:
-            return _set_managed_target_access(target, should_have_access)
+            return _set_managed_target_access(target, access, previous_users, created_default_acl)
     except FileNotFoundError:
         return AclOutcome.GONE
     except (OSError, UnsafePathError) as error:
@@ -774,8 +1008,46 @@ def set_managed_access(target_or_path: ManagedTarget | Path, should_have_access:
         return AclOutcome.FAILED
 
 
+@dataclass(frozen=True)
+class StateRecord:
+    ctime_ns: int
+    access: AccessLevel
+    anchor: Path
+    anchor_dev: int
+    anchor_ino: int
+    target_dev: int
+    target_ino: int
+    users: tuple[str, ...]
+    created_default_acl: bool
+
+    @property
+    def cache_key(self) -> tuple[int, AccessLevel, str, int, int, int, int, tuple[str, ...]]:
+        return (
+            self.ctime_ns, self.access, os.fspath(self.anchor), self.anchor_dev,
+            self.anchor_ino, self.target_dev, self.target_ino, self.users,
+        )
+
+
+def record_has_managed_acl(record: StateRecord) -> bool:
+    return record.access is not AccessLevel.NONE or record.created_default_acl
+
+
+def sqlite_identity(value: int) -> int:
+    return value if value < 1 << 63 else value - (1 << 64)
+
+
+def target_identity_changed(record: StateRecord, device: int, inode: int) -> bool:
+    return (record.target_dev, record.target_ino) != (
+        sqlite_identity(device), sqlite_identity(inode)
+    )
+
+
 class StateStore:
-    COLUMNS = {"path", "ctime_ns", "desired", "anchor", "anchor_dev", "anchor_ino"}
+    COLUMNS = {
+        "path", "ctime_ns", "access", "anchor", "anchor_dev", "anchor_ino",
+        "target_dev", "target_ino", "users", "created_default_acl",
+    }
+    LEGACY_COLUMNS = {"path", "ctime_ns", "desired", "anchor", "anchor_dev", "anchor_ino"}
 
     def __init__(self, path: Path | None = None) -> None:
         path = STATE_PATH if path is None else path
@@ -785,42 +1057,129 @@ class StateStore:
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
         columns = {row[1] for row in self.connection.execute("PRAGMA table_info(paths)")}
-        if columns and columns != self.COLUMNS:
-            self.connection.execute("DROP TABLE paths")
+        if columns and frozenset(columns) not in {
+            frozenset(self.COLUMNS), frozenset(self.LEGACY_COLUMNS)
+        }:
+            self.connection.close()
+            raise ValueError("Unsupported state database schema; refusing to discard revoke provenance")
+        if columns == self.LEGACY_COLUMNS:
+            legacy_rows = self.connection.execute(
+                "SELECT path, ctime_ns, desired, anchor, anchor_dev, anchor_ino FROM paths"
+            ).fetchall()
+            if any(bool(row[2]) for row in legacy_rows) and not LEGACY_ACL_USERS:
+                self.connection.close()
+                raise ValueError(
+                    "LEGACY_ACL_USERS is required to migrate managed legacy state safely"
+                )
+            migration_rows: list[tuple[object, ...]] = []
+            for path_value, ctime_ns, desired, anchor, anchor_dev, anchor_ino in legacy_rows:
+                target_dev = target_ino = 0
+                try:
+                    metadata = Path(path_value).lstat()
+                except FileNotFoundError:
+                    if desired:
+                        self.connection.close()
+                        raise ValueError(
+                            f"Cannot migrate managed legacy state for missing path: {path_value}"
+                        )
+                else:
+                    if desired and stat.S_ISLNK(metadata.st_mode):
+                        self.connection.close()
+                        raise ValueError(
+                            f"Cannot migrate managed legacy state for symbolic link: {path_value}"
+                        )
+                    target_dev = sqlite_identity(metadata.st_dev)
+                    target_ino = sqlite_identity(metadata.st_ino)
+                migration_rows.append(
+                    (
+                        path_value, ctime_ns, 2 if desired else 0, anchor, anchor_dev, anchor_ino,
+                        target_dev, target_ino, ",".join(LEGACY_ACL_USERS) if desired else "", 0,
+                    )
+                )
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                self.connection.execute("ALTER TABLE paths RENAME TO paths_legacy")
+                self._create_table()
+                self.connection.executemany(
+                    """
+                    INSERT INTO paths(
+                        path, ctime_ns, access, anchor, anchor_dev, anchor_ino,
+                        target_dev, target_ino, users, created_default_acl
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    migration_rows,
+                )
+                self.connection.execute("DROP TABLE paths_legacy")
+                self.connection.commit()
+            except BaseException:
+                self.connection.rollback()
+                self.connection.close()
+                raise
+        else:
+            self._create_table()
+            self.connection.commit()
+
+    def _create_table(self) -> None:
         self.connection.execute(
             """
             CREATE TABLE IF NOT EXISTS paths (
                 path TEXT PRIMARY KEY,
                 ctime_ns INTEGER NOT NULL,
-                desired INTEGER NOT NULL,
+                access INTEGER NOT NULL,
                 anchor TEXT NOT NULL,
                 anchor_dev INTEGER NOT NULL,
-                anchor_ino INTEGER NOT NULL
+                anchor_ino INTEGER NOT NULL,
+                target_dev INTEGER NOT NULL,
+                target_ino INTEGER NOT NULL,
+                users TEXT NOT NULL,
+                created_default_acl INTEGER NOT NULL
             )
             """
         )
-        self.connection.commit()
 
-    def get(self, path: Path) -> tuple[int, bool, str, int, int] | None:
+    def get(self, path: Path) -> StateRecord | None:
         row = self.connection.execute(
-            "SELECT ctime_ns, desired, anchor, anchor_dev, anchor_ino FROM paths WHERE path = ?",
+            "SELECT ctime_ns, access, anchor, anchor_dev, anchor_ino, target_dev, target_ino, "
+            "users, created_default_acl "
+            "FROM paths WHERE path = ?",
             (os.fspath(path),),
         ).fetchone()
-        return (int(row[0]), bool(row[1]), str(row[2]), int(row[3]), int(row[4])) if row else None
+        if row is None:
+            return None
+        return StateRecord(
+            int(row[0]), AccessLevel(int(row[1])), Path(row[2]), int(row[3]), int(row[4]),
+            int(row[5]), int(row[6]), tuple(item for item in str(row[7]).split(",") if item),
+            bool(row[8]),
+        )
 
-    def put(self, target: ManagedTarget, desired: bool, anchor: ManagedRoot) -> None:
+    def put(
+        self, target: ManagedTarget, access: AccessLevel, anchor: ManagedRoot,
+        previous: StateRecord | None = None,
+    ) -> None:
         metadata = os.fstat(target.fd)
         self.connection.execute(
             """
-            INSERT INTO paths(path, ctime_ns, desired, anchor, anchor_dev, anchor_ino)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO paths(
+                path, ctime_ns, access, anchor, anchor_dev, anchor_ino,
+                target_dev, target_ino, users, created_default_acl
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET ctime_ns=excluded.ctime_ns,
-                desired=excluded.desired, anchor=excluded.anchor,
-                anchor_dev=excluded.anchor_dev, anchor_ino=excluded.anchor_ino
+                access=excluded.access, anchor=excluded.anchor,
+                anchor_dev=excluded.anchor_dev, anchor_ino=excluded.anchor_ino,
+                target_dev=excluded.target_dev, target_ino=excluded.target_ino,
+                users=excluded.users, created_default_acl=excluded.created_default_acl
             """,
             (
-                os.fspath(target.display_path), metadata.st_ctime_ns, int(desired),
+                os.fspath(target.display_path), metadata.st_ctime_ns, access.value,
                 os.fspath(anchor.path), anchor.device, anchor.inode,
+                sqlite_identity(metadata.st_dev), sqlite_identity(metadata.st_ino),
+                ",".join(ACL_USERS),
+                int(
+                    False if target.default_acl_cleared
+                    else target.created_default_acl or bool(previous and previous.created_default_acl)
+                ),
             ),
         )
 
@@ -840,18 +1199,26 @@ class StateStore:
             (os.fspath(anchor), anchor_dev, anchor_ino),
         )
 
-    def iter_items(self, batch_size: int = 512) -> Iterator[tuple[Path, int, bool, Path, int, int]]:
+    def iter_items(self, batch_size: int = 512) -> Iterator[tuple[Path, StateRecord]]:
         last_path = ""
         while rows := self.connection.execute(
             """
-            SELECT path, ctime_ns, desired, anchor, anchor_dev, anchor_ino
+            SELECT path, ctime_ns, access, anchor, anchor_dev, anchor_ino,
+                   target_dev, target_ino, users, created_default_acl
             FROM paths WHERE path > ? ORDER BY path LIMIT ?
             """,
             (last_path, batch_size),
         ).fetchall():
-            for path, ctime_ns, desired, anchor, anchor_dev, anchor_ino in rows:
+            for (
+                path, ctime_ns, access, anchor, anchor_dev, anchor_ino,
+                target_dev, target_ino, users, created_default_acl,
+            ) in rows:
                 last_path = str(path)
-                yield Path(path), int(ctime_ns), bool(desired), Path(anchor), int(anchor_dev), int(anchor_ino)
+                yield Path(path), StateRecord(
+                    int(ctime_ns), AccessLevel(int(access)), Path(anchor), int(anchor_dev), int(anchor_ino),
+                    int(target_dev), int(target_ino),
+                    tuple(item for item in str(users).split(",") if item), bool(created_default_acl),
+                )
 
     def commit(self) -> None:
         self.connection.commit()
@@ -885,75 +1252,115 @@ def choose_allowed_root(path: Path, roots: Iterable[Path]) -> Path:
 
 def reconcile_path(
     path: Path,
-    desired: bool,
+    desired: AccessLevel,
     state: StateStore,
     force: bool = False,
     allowed_roots: Iterable[Path] | None = None,
     managed_root: ManagedRoot | None = None,
 ) -> ReconcileStats:
     stats = ReconcileStats(visited=1)
+    if isinstance(desired, bool):
+        desired = AccessLevel.FULL if desired else AccessLevel.NONE
     if managed_root is None:
         try:
             root_path = choose_allowed_root(path, allowed_roots or [path.parent])
             with ManagedRoot(root_path) as opened:
                 return reconcile_path(path, desired, state, force, managed_root=opened)
         except FileNotFoundError:
-            state.delete_prefix(path)
             return stats
         except (OSError, UnsafePathError) as error:
             log(f"ACL target rejected for {path}: {error}")
             stats.failed = 1
             return stats
+    previous = state.get(path)
     try:
         with managed_root.open_target(path) as target:
             if stat.S_ISLNK(target.mode):
-                state.delete(path)
+                if previous is not None and record_has_managed_acl(previous):
+                    log(f"Managed path became a symbolic link; retaining revoke state: {path}")
+                    stats.failed = 1
+                else:
+                    state.delete(path)
                 return stats
-            desired = desired and (stat.S_ISDIR(target.mode) or stat.S_ISREG(target.mode))
+            if not (stat.S_ISDIR(target.mode) or stat.S_ISREG(target.mode)):
+                desired = AccessLevel.NONE
             metadata = os.fstat(target.fd)
+            if previous is not None and record_has_managed_acl(previous) and target_identity_changed(
+                previous, metadata.st_dev, metadata.st_ino
+            ):
+                log(f"Managed path identity changed; retaining revoke state: {path}")
+                stats.failed = 1
+                return stats
             current_key = (
                 metadata.st_ctime_ns, desired, os.fspath(managed_root.path),
                 managed_root.device, managed_root.inode,
+                sqlite_identity(metadata.st_dev), sqlite_identity(metadata.st_ino),
+                tuple(ACL_USERS),
             )
-            if not force and state.get(path) == current_key:
+            if not force and previous is not None and previous.cache_key == current_key:
                 return stats
             stats.acl_reads = 1
-            outcome = set_managed_access(target, desired)
+            outcome = set_managed_access(
+                target,
+                desired,
+                previous.users if previous else (),
+                previous.created_default_acl if previous else False,
+            )
             if outcome in {AclOutcome.UNCHANGED, AclOutcome.CHANGED}:
-                state.put(target, desired, managed_root)
+                state.put(target, desired, managed_root, previous)
                 stats.changed = int(outcome is AclOutcome.CHANGED)
             elif outcome is AclOutcome.GONE:
-                state.delete_prefix(path)
+                log(f"ACL target disappeared; retaining state for safe recovery: {path}")
             else:
                 stats.failed = 1
     except FileNotFoundError:
-        state.delete_prefix(path)
+        log(f"ACL target disappeared; retaining state for safe recovery: {path}")
     except (OSError, UnsafePathError) as error:
         log(f"ACL target rejected for {path}: {error}")
         stats.failed = 1
     return stats
 
 
-def desired_for_matcher(path: Path, root: Path, matcher: IgnoreMatcher, directory: bool) -> bool:
+def desired_for_matcher(path: Path, root: Path, matcher: IgnoreMatcher, directory: bool) -> AccessLevel:
     if path == root:
-        return True
+        return AccessLevel.FULL
     relative = path.relative_to(root).as_posix()
     if matcher.is_control_path(relative):
-        return True
-    return matcher.directory_requires_access(relative) if directory else matcher.is_included(relative)
+        return AccessLevel.NONE
+    if directory:
+        return matcher.directory_access(relative)
+    return AccessLevel.FULL if matcher.is_included(relative) else AccessLevel.NONE
 
 
-def walk_paths(root: Path) -> Iterator[Path]:
+def walk_paths(
+    root: Path, stats: ReconcileStats | None = None, managed_root: ManagedRoot | None = None
+) -> Iterator[Path]:
     if not root.exists() and not root.is_symlink():
         return
     if not root.is_dir() or root.is_symlink():
         yield root
         return
-    for directory, directory_names, file_names in os.walk(
-        root, followlinks=False, onerror=lambda error: log(f"Tree scan failed: {error}")
-    ):
+    def record_error(error: OSError) -> None:
+        log(f"Tree scan failed: {error}")
+        if stats is not None:
+            stats.failed += 1
+
+    for directory, directory_names, file_names in os.walk(root, followlinks=False, onerror=record_error):
         directory_path = Path(directory)
-        directory_names[:] = [name for name in directory_names if not (directory_path / name).is_symlink()]
+        safe_directories: list[str] = []
+        for name in directory_names:
+            child = directory_path / name
+            if child.is_symlink():
+                continue
+            if managed_root is not None:
+                try:
+                    with managed_root.open_target(child):
+                        pass
+                except (OSError, UnsafePathError) as error:
+                    record_error(OSError(f"Cannot enter {child}: {error}"))
+                    continue
+            safe_directories.append(name)
+        directory_names[:] = safe_directories
         yield directory_path
         for file_name in file_names:
             file_path = directory_path / file_name
@@ -969,7 +1376,7 @@ def reconcile_tree(
     force: bool = False,
 ) -> ReconcileStats:
     stats = ReconcileStats()
-    for path in walk_paths(root):
+    for path in walk_paths(root, stats, managed_root):
         try:
             directory = path.is_dir()
         except OSError:
@@ -1005,42 +1412,67 @@ def policies_for_path(path: Path, policies: Iterable[FolderPolicy]) -> list[Fold
     return [policy for policy in policies if path == policy.root or path.is_relative_to(policy.root)]
 
 
-def desired_for_policies(path: Path, directory: bool, policies: list[FolderPolicy]) -> bool:
-    return any(
-        desired_for_matcher(path, policy.root, policy.matcher, directory)
-        for policy in policies_for_path(path, policies)
-    )
+def desired_for_policies(path: Path, directory: bool, policies: list[FolderPolicy]) -> AccessLevel:
+    applicable = policies_for_path(path, policies)
+    for policy in applicable:
+        if path != policy.root and policy.matcher.is_control_path(path.relative_to(policy.root).as_posix()):
+            return AccessLevel.NONE
+    levels = [desired_for_matcher(path, policy.root, policy.matcher, directory) for policy in applicable]
+    return max(levels, key=lambda item: item.value, default=AccessLevel.NONE)
 
 
 def reconcile_removed_state(
     state: StateStore, policies: list[FolderPolicy], stats: ReconcileStats, force: bool
 ) -> None:
     invalid_anchors: set[tuple[Path, int, int]] = set()
-    for path, _ctime, _desired, anchor, anchor_dev, anchor_ino in state.iter_items():
-        anchor_key = (anchor, anchor_dev, anchor_ino)
+    for path, record in state.iter_items():
+        if policies_for_path(path, policies):
+            try:
+                metadata = path.lstat()
+            except FileNotFoundError:
+                if record_has_managed_acl(record):
+                    stats.failed += 1
+                    log(f"Managed path is missing; retaining revoke state: {path}")
+                else:
+                    state.delete(path)
+            else:
+                if stat.S_ISLNK(metadata.st_mode):
+                    if record_has_managed_acl(record):
+                        stats.failed += 1
+                        log(f"Managed path became a symbolic link; retaining revoke state: {path}")
+                    else:
+                        state.delete(path)
+            continue
+        anchor = record.anchor
+        anchor_key = (anchor, record.anchor_dev, record.anchor_ino)
         if anchor_key in invalid_anchors:
             continue
         try:
             metadata = path.lstat()
         except FileNotFoundError:
-            state.delete(path)
+            if record.access is AccessLevel.NONE and not record.created_default_acl:
+                state.delete(path)
+            else:
+                stats.failed += 1
+                log(f"Former managed path is missing; retaining revoke state: {path}")
             continue
         if stat.S_ISLNK(metadata.st_mode):
-            state.delete(path)
-            continue
-        if policies_for_path(path, policies):
+            if record.access is AccessLevel.NONE and not record.created_default_acl:
+                state.delete(path)
+            else:
+                stats.failed += 1
+                log(f"Former managed path became a symbolic link; retaining revoke state: {path}")
             continue
         try:
             with ManagedRoot(anchor) as managed_root:
-                if (managed_root.device, managed_root.inode) != (anchor_dev, anchor_ino):
+                if (managed_root.device, managed_root.inode) != (record.anchor_dev, record.anchor_ino):
                     invalid_anchors.add(anchor_key)
-                    state.delete_anchor(anchor, anchor_dev, anchor_ino)
                     stats.failed += 1
                     log(
                         f"Former managed root identity changed; cached ACL cleanup was quarantined: {anchor}"
                     )
                     continue
-                result = reconcile_path(path, False, state, force, managed_root=managed_root)
+                result = reconcile_path(path, AccessLevel.NONE, state, force, managed_root=managed_root)
                 stats.absorb(result)
                 if not result.failed:
                     state.delete(path)
@@ -1056,6 +1488,7 @@ def reconcile_all(policies: list[FolderPolicy], state: StateStore, force: bool =
     for root in roots:
         if not root.is_dir():
             log(f"Configured folder is not available yet: {root}")
+            stats.failed += 1
             continue
         try:
             with ManagedRoot(root) as managed_root:
@@ -1149,6 +1582,10 @@ def events_require_full_reconciliation(events: set[str]) -> bool:
     return bool({"Q_OVERFLOW", "DELETE_SELF", "MOVE_SELF"} & events)
 
 
+def folder_event_reconciliation_allowed(policy_dirty: bool) -> bool:
+    return not policy_dirty
+
+
 def record_reconciliation_result(stats: ReconcileStats, retry: RetryBackoff, now: float) -> bool:
     if stats.failed:
         retry.failed(now)
@@ -1179,11 +1616,20 @@ def start_inotify(kind: str, paths: list[Path], recursive: bool) -> Watcher | No
     return Watcher(kind, subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0))
 
 
-def start_watchers(config_path: Path, policies: list[FolderPolicy]) -> tuple[selectors.BaseSelector, list[Watcher]]:
+def start_watchers(
+    config_path: Path, allowlist_path: Path, policies: list[FolderPolicy]
+) -> tuple[selectors.BaseSelector, list[Watcher]]:
     selector = selectors.DefaultSelector()
     existing = [root for root in compact_roots(policy.root for policy in policies) if root.is_dir()]
+    nested_mounts = nested_mount_points(existing)
+    if nested_mounts:
+        selector.close()
+        raise UnsafePathError(
+            "Managed roots contain nested mounts: " + ", ".join(map(os.fspath, nested_mounts))
+        )
+    policy_parents = sorted({config_path.parent, allowlist_path.parent}, key=os.fspath)
     candidates = [
-        start_inotify("config", [config_path.parent], False),
+        start_inotify("policy", policy_parents, False),
         start_inotify("folders", existing, True),
     ]
     watchers = [watcher for watcher in candidates if watcher is not None]
@@ -1223,6 +1669,22 @@ def parse_event(line: bytes | bytearray) -> tuple[set[str], Path] | None:
     return set(os.fsdecode(raw_events).split(",")), Path(os.fsdecode(raw_path))
 
 
+def nested_mount_points(roots: Iterable[Path]) -> list[Path]:
+    normalized_roots = [Path(os.path.abspath(root)) for root in roots]
+    mount_points: list[Path] = []
+    for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            raise ValueError("Malformed /proc/self/mountinfo entry")
+        decoded = re.sub(
+            r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), fields[4]
+        )
+        mount_point = Path(os.path.abspath(decoded))
+        if any(mount_point != root and mount_point.is_relative_to(root) for root in normalized_roots):
+            mount_points.append(mount_point)
+    return sorted(set(mount_points), key=os.fspath)
+
+
 def daemon() -> int:
     home = syncthing_home()
     config_path = locate_config(home)
@@ -1232,7 +1694,7 @@ def daemon() -> int:
     tree_dirty = record_reconciliation_result(
         reconcile_all(policies, state), tree_retry, time.monotonic()
     )
-    selector, watchers = start_watchers(config_path, policies)
+    selector, watchers = start_watchers(config_path, ALLOWLIST_PATH, policies)
     policy_retry, watcher_retry = RetryBackoff(), RetryBackoff()
     policy_dirty = watchers_dirty = False
     next_full = time.monotonic() + seconds_until_next_refresh()
@@ -1270,7 +1732,8 @@ def daemon() -> int:
                 next_missing = now + MISSING_FOLDER_RECHECK_SECONDS
 
             watcher_failed = False
-            for key, _mask in ready:
+            pending_events: list[tuple[Watcher, set[str], Path]] = []
+            for key, _mask in sorted(ready, key=lambda item: item[0].data.kind != "policy"):
                 watcher: Watcher = key.data
                 chunk = os.read(key.fileobj.fileno(), 65536)
                 if not chunk:
@@ -1286,24 +1749,37 @@ def daemon() -> int:
                         continue
                     events, event_path = parsed
                     event_path = Path(os.path.abspath(event_path))
-                    if events_require_full_reconciliation(events):
+                    pending_events.append((watcher, events, event_path))
+
+            for watcher, events, event_path in pending_events:
+                if watcher.kind == "policy" and event_path in {config_path, ALLOWLIST_PATH}:
+                    policy_dirty = True
+                    policy_retry.trigger(now)
+                elif watcher.kind == "folders" and is_control_event(event_path, policies) and (
+                    {"CLOSE_WRITE", "MOVED_TO", "CREATE", "DELETE"} & events
+                ):
+                    policy_dirty = True
+                    policy_retry.trigger(now)
+
+            for watcher, events, event_path in pending_events:
+                if events_require_full_reconciliation(events):
+                    tree_dirty = True
+                    tree_retry.trigger(now)
+                if "Q_OVERFLOW" in events:
+                    continue
+                if watcher.kind == "policy" or watcher.kind == "folders" and is_control_event(
+                    event_path, policies
+                ) and ({"CLOSE_WRITE", "MOVED_TO", "CREATE", "DELETE"} & events):
+                    continue
+                if watcher.kind == "folders":
+                    if not folder_event_reconciliation_allowed(policy_dirty):
                         tree_dirty = True
                         tree_retry.trigger(now)
-                    if "Q_OVERFLOW" in events:
                         continue
-                    if watcher.kind == "config" and event_path == config_path:
-                        policy_dirty = True
-                        policy_retry.trigger(now)
-                    elif watcher.kind == "folders" and is_control_event(event_path, policies) and (
-                        {"CLOSE_WRITE", "MOVED_TO", "CREATE", "DELETE"} & events
-                    ):
-                        policy_dirty = True
-                        policy_retry.trigger(now)
-                    elif watcher.kind == "folders":
-                        event_stats = reconcile_event_path(event_path, policies, state)
-                        if event_stats.failed:
-                            tree_dirty = True
-                            tree_retry.failed(now)
+                    event_stats = reconcile_event_path(event_path, policies, state)
+                    if event_stats.failed:
+                        tree_dirty = True
+                        tree_retry.failed(now)
 
             if watcher_failed:
                 stop_watchers(selector, watchers)
@@ -1333,7 +1809,9 @@ def daemon() -> int:
                 )
             if watchers_dirty and watcher_retry.is_due(now):
                 try:
-                    replacement_selector, replacement_watchers = start_watchers(config_path, policies)
+                    replacement_selector, replacement_watchers = start_watchers(
+                        config_path, ALLOWLIST_PATH, policies
+                    )
                 except OSError as error:
                     log(f"Cannot start filesystem watchers; retrying: {error}")
                     watcher_retry.failed(now)
@@ -1359,6 +1837,24 @@ def scan_once(force: bool = False) -> int:
         state.close()
 
 
+def revoke_all_recorded(force: bool = True) -> int:
+    state = StateStore()
+    stats = ReconcileStats()
+    started = time.monotonic()
+    try:
+        reconcile_removed_state(state, [], stats, force)
+        state.commit()
+        stats.elapsed = time.monotonic() - started
+        remaining = sum(1 for _item in state.iter_items())
+        log(
+            f"Recorded ACL revocation complete: changed={stats.changed} "
+            f"failed={stats.failed} unresolved={remaining} elapsed={stats.elapsed:.3f}s"
+        )
+        return 1 if stats.failed or remaining else 0
+    finally:
+        state.close()
+
+
 def main() -> int:
     try:
         settings = parse_runtime_settings()
@@ -1366,8 +1862,13 @@ def main() -> int:
         pwd.getpwnam(SYNCTHING_USER)
         for user in ACL_USERS:
             pwd.getpwnam(user)
+        if settings.revoke_all:
+            return revoke_all_recorded()
         return scan_once(settings.force) if settings.scan else daemon()
-    except (OSError, ET.ParseError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+    except (
+        OSError, UnsafePathError, ET.ParseError, ValueError, KeyError,
+        subprocess.CalledProcessError,
+    ) as error:
         log(f"Fatal error: {error}")
         return 1
 

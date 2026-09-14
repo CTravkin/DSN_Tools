@@ -2,13 +2,15 @@
 
 [English](README.md) | [Русский](README.ru.md)
 
-Utilities for system administration and Windows desktop automation.
+Small tools for recurring system and desktop tasks.
 
-## Components
+## Utilities
 
-| Component | Type | Platform | Purpose |
-|---|---|---|---|
-| [Syncthing ACL Refresh](Syncthing_ACL_Refresh/README.md) · `Syncthing_ACL_Refresh/` | Worker | Linux | Reconciles POSIX ACLs with Syncthing folders and ignore rules |
-| [Remote WoL Gateway](Remote_WoL_Gateway/README.md) · `Remote_WoL_Gateway/` | Backend | Linux | Provides an authenticated HTTP gateway for waking one machine |
-| [Windows Icon Recovery](Windows_Icon_Recovery/README.md) · `Windows_Icon_Recovery/` | Tool | Windows | Captures, audits, backs up, and restores folder and shortcut icons |
-| [MSStore EXE Launcher](MSStore_EXE_Launcher/README.md) · `MSStore_EXE_Launcher/` | Tool | Windows | Builds standalone launchers for packaged, desktop, and tray applications |
+| Utility | Platform | Purpose |
+|---|---|---|
+| [Syncthing ACL Refresh](Syncthing_ACL_Refresh/README.md) | Linux | Reconciles named POSIX ACL entries with Syncthing folders and ignore rules |
+| [Remote WoL Gateway](Remote_WoL_Gateway/README.md) | Linux | Exposes an authenticated API for checking and waking one machine |
+| [Windows Icon Recovery](Windows_Icon_Recovery/README.md) | Windows | Captures, audits, backs up, restores, and rolls back folder and shortcut icons |
+| [MSStore EXE Launcher](MSStore_EXE_Launcher/README.md) | Windows | Builds EXE launchers for packaged apps, with optional desktop and tray modes |
+
+Each directory is self-contained. Use its README for requirements, configuration, commands, and limitations.

@@ -1,81 +1,93 @@
 # Syncthing ACL Refresh
 
-[English](README.md) | [Русский](README.ru.md)
+[English](README.md) | [Русский](README.ru.md) | [DSN Tools](../README.ru.md)
 
-[К DSN Tools](../README.ru.md)
+`syncthing-acl-refresh` синхронизирует именованные записи POSIX ACL с локальными папками Syncthing и их фактическими правилами исключения. Включенные файлы получают доступ для настроенных пользователей; с исключенных файлов удаляются только ACL, которыми управляет эта утилита.
 
-`syncthing-acl-refresh` синхронизирует именованные записи POSIX ACL с папками и фактическими правилами исключения локального экземпляра Syncthing.
-
-Управляемые пользователи получают доступ к включенным объектам и теряют только свои именованные ACL на исключенных объектах. Владение, базовые права, посторонние ACL, содержимое и символические ссылки сохраняются. Выход через символическую ссылку и расширение чужих прав через ACL mask блокируются.
-
-## Стек
-
-Стандартная библиотека Python, SQLite, systemd, утилиты POSIX ACL и inotify-tools.
+Процесс работает от root. Он принимает папку только при точном совпадении ID Syncthing и абсолютного пути с root-owned allowlist. Также блокируются символические ссылки в управляемом пути, вложенные mount, системные директории, не-loopback адреса Syncthing, обычный HTTP и изменения ACL mask, расширяющие посторонний доступ.
 
 ## Требования
 
-- Linux с Python 3.10 или новее и systemd
-- Права root
+- Linux, Python 3.10+ и systemd
 - `getfacl`, `setfacl` и `inotifywait`
 - Syncthing GUI с HTTPS на loopback IP
-- PEM-копия сертификата Syncthing GUI под управлением root
-- Существующие учетные записи для всех управляемых пользователей
+- Копия сертификата Syncthing GUI под управлением root
+- Существующие локальные учетные записи из `ACL_USERS`
 
-Параметры командной строки имеют приоритет над соответствующими переменными окружения.
+## Конфигурация
+
+Скопируй [`syncthing-acl-refresh.env.example`](syncthing-acl-refresh.env.example) и [`folders.conf.example`](folders.conf.example).
 
 | Переменная | Обязательна | По умолчанию | Назначение |
 |---|---:|---|---|
-| `ACL_USERS` | да | — | Управляемые пользователи через запятую |
-| `SYNCTHING_USER` | нет | `syncthing` | Сервисная учетная запись Syncthing |
-| `SYNCTHING_CONFIG` | нет | автоопределение | Абсолютный путь к `config.xml` |
-| `STATE_PATH` | нет | `/var/lib/syncthing-acl-refresh/state.sqlite3` | Кеш SQLite |
+| `ACL_USERS` | да | — | Учетные записи через запятую, чьими ACL управляет утилита |
+| `LEGACY_ACL_USERS` | только для миграции | — | Учетные записи, которыми управляла предыдущая установка |
+| `SYNCTHING_USER` | нет | `syncthing` | Учетная запись, из которой читается конфигурация Syncthing |
+| `SYNCTHING_CONFIG` | нет | определяется по этой учетной записи | Абсолютный путь к `config.xml` |
+| `STATE_PATH` | нет | `/var/lib/syncthing-acl-refresh/state.sqlite3` | Состояние синхронизации и отзыва ACL |
 | `TLS_CERTIFICATE` | нет | `/etc/syncthing-acl-refresh/https-cert.pem` | Закрепленный сертификат GUI |
-| `REFRESH_HOURS` | нет | `3` | Интервал полного сканирования; должен делить 24 |
+| `FOLDER_ALLOWLIST` | нет | `/etc/syncthing-acl-refresh/folders.conf` | Список разрешенных папок под управлением root |
+| `REFRESH_HOURS` | нет | `3` | Интервал полного прохода; положительный делитель 24 |
 | `MISSING_RECHECK_SECONDS` | нет | `60` | Повторная проверка отсутствующих корней, 1–3600 секунд |
 
-Пример: [`syncthing-acl-refresh.env.example`](syncthing-acl-refresh.env.example).
+Формат allowlist: `folder-id=/absolute/path`, одна строка на каждую папку Syncthing. Файл и все родительские директории должны принадлежать root и не разрешать запись группе или остальным пользователям. Каждой настроенной папке должна соответствовать ровно одна строка; лишние, отсутствующие, дублирующиеся или измененные записи останавливают синхронизацию.
 
-## Интеграции
+Параметры CLI имеют приоритет над ENV-файлом. `--env-file` нужен для прямого запуска; systemd сам загружает установленный ENV-файл.
 
-Воркер читает XML-конфигурацию Syncthing и развернутые правила исключения через его loopback HTTPS API. API-ключ остается в конфигурации Syncthing.
+При обновлении базы состояния, созданной старой версией, укажи в `LEGACY_ACL_USERS` точное прежнее значение `ACL_USERS` для первого запуска. После успешной миграции удали параметр. Если прежних пользователей или управляемый объект нельзя безопасно идентифицировать, миграция остановится без изменения базы.
 
-## Эксплуатация
-
-### Установка
+## Установка и запуск
 
 ```sh
 sudo install -m 0755 syncthing-acl-refresh /usr/local/sbin/syncthing-acl-refresh
 sudo install -d -m 0700 /etc/syncthing-acl-refresh /var/lib/syncthing-acl-refresh
 sudo install -m 0600 syncthing-acl-refresh.env.example /etc/syncthing-acl-refresh/syncthing-acl-refresh.env
-sudo install -m 0644 syncthing-acl-refresh.service /etc/systemd/system/syncthing-acl-refresh.service
+sudo install -m 0600 folders.conf.example /etc/syncthing-acl-refresh/folders.conf
 sudo install -m 0600 /path/to/syncthing-https-cert.pem /etc/syncthing-acl-refresh/https-cert.pem
+sudo install -m 0644 syncthing-acl-refresh.service /etc/systemd/system/syncthing-acl-refresh.service
 ```
 
-Отредактируй установленный ENV-файл. При смене сертификата Syncthing GUI замени закрепленную копию.
-
-### Запуск
+Отредактируй оба файла конфигурации и перед включением сервиса выполни разовую проверку:
 
 ```sh
-sudo /usr/local/sbin/syncthing-acl-refresh --scan
-sudo /usr/local/sbin/syncthing-acl-refresh --scan --force
+sudo /usr/local/sbin/syncthing-acl-refresh \
+  --env-file /etc/syncthing-acl-refresh/syncthing-acl-refresh.env \
+  --scan --force
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now syncthing-acl-refresh.service
 sudo journalctl -u syncthing-acl-refresh.service
 ```
 
-`--scan` выполняет один проход. `--force` игнорирует кеш метаданных и повторно читает ACL. Непрерывный режим использует inotify, периодические полные сканирования, кеш SQLite и повторные попытки с задержкой.
+Непрерывный режим следит за конфигурацией Syncthing, allowlist, управляющими ignore-файлами и деревьями папок. Пропущенные или неудачные события покрываются полными проходами и повторными попытками с задержкой.
 
-### Проверка
+## Проверка, отзыв и удаление
+
+`--scan` возвращает `0` при успехе и `1`, если хотя бы один путь обработать не удалось. `--force` отключает кеш метаданных для текущего прохода.
+
+Перед удалением папки из allowlist или самой утилиты останови сервис и отзови все ACL, записанные в state:
+
+```sh
+sudo systemctl stop syncthing-acl-refresh.service
+sudo /usr/local/sbin/syncthing-acl-refresh \
+  --env-file /etc/syncthing-acl-refresh/syncthing-acl-refresh.env \
+  --revoke-all
+```
+
+Код `1` означает, что некоторые записанные пути не удалось безопасно идентифицировать или очистить. Сохрани базу состояния и разберись с этими путями до удаления установки.
+
+## Тесты
 
 ```sh
 sudo ACL_TEST_USERS=root,nobody python3 -m unittest discover -s tests -v
 ```
 
-Интеграционным тестам нужны root, два существующих пользователя, `getfacl`, `setfacl`, `runuser` и `openssl`. Других пользователей можно указать через `ACL_TEST_USERS`.
+Интеграционным тестам ACL нужны root, два существующих пользователя, `getfacl`, `setfacl`, `runuser` и `openssl`.
 
 ## Ограничения
 
-- Имена хостов, не-loopback адреса GUI и обычный HTTP отклоняются
-- Существующие default ACL могут влиять на права, наследуемые новыми объектами
+- Объект, перемещенный за пределы наблюдаемого корня, может сохранить ACL; незавершенная запись остается для ручного восстановления
+- Жесткие ссылки используют один inode, поэтому изменение ссылки внутри корня действует и на ссылки на тот же inode снаружи
+- Вложенные файловые системы блокируются; настрой каждую как отдельную разрешенную папку Syncthing
+- Существующие посторонние default ACL продолжают действовать
 - Специальные файлы никогда не получают управляемый доступ

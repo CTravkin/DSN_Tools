@@ -14,7 +14,10 @@ function ConvertTo-CSharpLiteral {
             "`n" { [void]$builder.Append('\n') }
             "`t" { [void]$builder.Append('\t') }
             default {
-                if ($code -lt 32) { [void]$builder.AppendFormat('\u{0:X4}', $code) }
+                if ($code -lt 32 -or $code -eq 0x2028 -or $code -eq 0x2029 -or
+                    [char]::IsSurrogate($character)) {
+                    [void]$builder.AppendFormat('\u{0:X4}', $code)
+                }
                 else { [void]$builder.Append($character) }
             }
         }
@@ -33,8 +36,16 @@ function Resolve-StoreAppId {
     if ($matches.Count -eq 0) { throw "No registered application has the exact name '$AppName'" }
     if ($matches.Count -gt 1) { throw "The name '$AppName' matches multiple registered applications; specify -AppId" }
     $appId = [string]$matches[0].AppID
-    if ([string]::IsNullOrWhiteSpace($appId)) { throw "The registered application '$AppName' has no AUMID" }
+    if (-not (Test-StoreAppId -AppId $appId)) { throw "The registered application '$AppName' has an invalid AUMID" }
     $appId
+}
+
+function Test-StoreAppId {
+    param([AllowEmptyString()][string]$AppId)
+
+    -not [string]::IsNullOrWhiteSpace($AppId) -and
+        $AppId.Length -le 255 -and
+        $AppId -match '^[A-Za-z0-9][A-Za-z0-9._-]*![A-Za-z0-9][A-Za-z0-9._-]*$'
 }
 
 function Get-FrameworkCompiler {
@@ -62,17 +73,28 @@ function Invoke-TemplateLauncherBuild {
         [Parameter(Mandatory)][string]$OutputPath,
         [Parameter(Mandatory)][hashtable]$Replacement,
         [string[]]$Reference = @(),
-        [string]$IconPath
+        [string]$IconPath,
+        [switch]$Force
     )
 
     $template = (Resolve-Path -LiteralPath $TemplatePath).Path
     $output = [IO.Path]::GetFullPath($OutputPath)
     if ([IO.Path]::GetExtension($output) -ine '.exe') { throw 'OutputPath must end with .exe' }
+    if ((Test-Path -LiteralPath $output) -and -not $Force) {
+        throw "Output already exists; use -Force to replace it: $output"
+    }
     $parent = Split-Path -Parent $output
     if (-not (Test-Path -LiteralPath $parent -PathType Container)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-    $source = Get-Content -Raw -LiteralPath $template
-    foreach ($key in $Replacement.Keys) { $source = $source.Replace("__$key`__", [string]$Replacement[$key]) }
-    if ($source -match '__[A-Z0-9_]+__') { throw "Template contains an unresolved token: $($Matches[0])" }
+    $source = [IO.File]::ReadAllText($template, [Text.UTF8Encoding]::new($false, $true))
+    $tokens = @([regex]::Matches($source, '__[A-Z0-9_]+__') | ForEach-Object { $_.Value } | Select-Object -Unique)
+    foreach ($token in $tokens) {
+        $key = $token.Substring(2, $token.Length - 4)
+        if (-not $Replacement.ContainsKey($key)) { throw "Template contains an unresolved token: $token" }
+        $source = $source.Replace($token, [string]$Replacement[$key])
+    }
+    foreach ($key in $Replacement.Keys) {
+        if ($tokens -notcontains "__$key`__") { throw "Replacement does not exist in template: $key" }
+    }
 
     $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('DSNLauncherBuild-' + [guid]::NewGuid().ToString('N'))
     try {
@@ -93,7 +115,7 @@ function Invoke-TemplateLauncherBuild {
         if ($compilerExitCode -ne 0 -or -not (Test-Path -LiteralPath $compiled -PathType Leaf)) {
             throw "C# compilation failed with exit code $compilerExitCode`n$($compilerOutput -join "`n")"
         }
-        Copy-Item -LiteralPath $compiled -Destination $output -Force
+        Copy-Item -LiteralPath $compiled -Destination $output -Force:$Force
         $output
     }
     finally {
@@ -101,4 +123,4 @@ function Invoke-TemplateLauncherBuild {
     }
 }
 
-Export-ModuleMember -Function ConvertTo-CSharpLiteral,Resolve-StoreAppId,Get-FrameworkCompiler,Resolve-FrameworkAssembly,Invoke-TemplateLauncherBuild
+Export-ModuleMember -Function ConvertTo-CSharpLiteral,Resolve-StoreAppId,Test-StoreAppId,Get-FrameworkCompiler,Resolve-FrameworkAssembly,Invoke-TemplateLauncherBuild

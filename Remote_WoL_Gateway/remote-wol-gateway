@@ -8,9 +8,12 @@ import os
 import re
 import socket
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import PurePosixPath
+from socketserver import ThreadingMixIn
 from typing import Callable, Mapping
 from urllib.parse import urlparse
 
@@ -91,26 +94,29 @@ class Settings:
     ssh_key: str | None = None
     ssh_known_hosts: str | None = None
     ssh_interface: str | None = None
-    ssh_executable: str = "/usr/sbin/ether-wake"
+    ssh_executable: str = "/usr/local/sbin/remote-wol-sender"
 
     @classmethod
     def from_env(cls, environment: Mapping[str, str] | None = None) -> "Settings":
         env = os.environ if environment is None else environment
+        token = _required(env, "WOL_TOKEN")
+        if len(token.encode("utf-8")) < 32 or token == "replace-with-a-long-random-token":
+            raise ConfigurationError("WOL_TOKEN must be a non-placeholder secret of at least 32 bytes")
         target_ip = _required(env, "WOL_TARGET_IP")
         try:
-            ipaddress.ip_address(target_ip)
+            ipaddress.IPv4Address(target_ip)
         except ValueError as error:
-            raise ConfigurationError("WOL_TARGET_IP must be an IP address") from error
+            raise ConfigurationError("WOL_TARGET_IP must be an IPv4 address") from error
         bind = env.get("WOL_BIND", "127.0.0.1").strip()
         try:
-            ipaddress.ip_address(bind)
+            ipaddress.IPv4Address(bind)
         except ValueError as error:
-            raise ConfigurationError("WOL_BIND must be an IP address") from error
+            raise ConfigurationError("WOL_BIND must be an IPv4 address") from error
         broadcast = env.get("WOL_BROADCAST_IP", "255.255.255.255").strip()
         try:
-            ipaddress.ip_address(broadcast)
+            ipaddress.IPv4Address(broadcast)
         except ValueError as error:
-            raise ConfigurationError("WOL_BROADCAST_IP must be an IP address") from error
+            raise ConfigurationError("WOL_BROADCAST_IP must be an IPv4 address") from error
 
         check_ping = _boolean(env, "WOL_CHECK_PING", True)
         check_ports = _ports(env.get("WOL_CHECK_PORTS", ""))
@@ -136,22 +142,22 @@ class Settings:
                 "ssh_interface": "WOL_SSH_INTERFACE",
             }
             ssh_values = {field: _required(env, variable) for field, variable in mapping.items()}
-            if not re.fullmatch(r"[A-Za-z0-9_.:-]+", ssh_values["ssh_host"] or ""):
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+", ssh_values["ssh_host"] or ""):
                 raise ConfigurationError("WOL_SSH_HOST contains unsafe characters")
             if not re.fullmatch(r"[A-Za-z0-9_.-]+", ssh_values["ssh_user"] or ""):
                 raise ConfigurationError("WOL_SSH_USER contains unsafe characters")
             if not re.fullmatch(r"[A-Za-z0-9_.:-]+", ssh_values["ssh_interface"] or ""):
                 raise ConfigurationError("WOL_SSH_INTERFACE contains unsafe characters")
             for field in ("ssh_key", "ssh_known_hosts"):
-                if not os.path.isabs(ssh_values[field] or ""):
+                if not PurePosixPath(ssh_values[field] or "").is_absolute():
                     raise ConfigurationError(f"WOL_{field.upper()} must be an absolute path")
 
-        executable = env.get("WOL_SSH_EXECUTABLE", "/usr/sbin/ether-wake").strip()
-        if not os.path.isabs(executable) or not re.fullmatch(r"/[A-Za-z0-9_./-]+", executable):
+        executable = env.get("WOL_SSH_EXECUTABLE", "/usr/local/sbin/remote-wol-sender").strip()
+        if not PurePosixPath(executable).is_absolute() or not re.fullmatch(r"/[A-Za-z0-9_./-]+", executable):
             raise ConfigurationError("WOL_SSH_EXECUTABLE must be a safe absolute path")
 
         return cls(
-            token=_required(env, "WOL_TOKEN"),
+            token=token,
             target_ip=target_ip,
             target_mac=_mac(_required(env, "WOL_TARGET_MAC")),
             target_name=env.get("WOL_TARGET_NAME", "target").strip() or "target",
@@ -176,9 +182,14 @@ def build_magic_packet(mac_address: str) -> bytes:
     return b"\xff" * 6 + hardware * 16
 
 
-def build_ssh_command(settings: Settings) -> list[str]:
+def build_ssh_command(settings: Settings, action: str = "wake") -> list[str]:
     if settings.send_mode != "ssh":
         raise ValueError("SSH command requested for a non-SSH sender")
+    if action not in {"wake", "check"}:
+        raise ValueError("Unsupported SSH sender action")
+    remote_arguments = [f"--{action}", settings.ssh_interface or ""]
+    if action == "wake":
+        remote_arguments.append(settings.target_mac)
     return [
         "/usr/bin/ssh",
         "-i", settings.ssh_key or "",
@@ -187,12 +198,17 @@ def build_ssh_command(settings: Settings) -> list[str]:
         "-o", f"UserKnownHostsFile={settings.ssh_known_hosts}",
         "-o", "StrictHostKeyChecking=yes",
         "-o", "ConnectTimeout=5",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "ClearAllForwardings=yes",
+        "-o", "PermitLocalCommand=no",
+        "-o", "LogLevel=ERROR",
         f"{settings.ssh_user}@{settings.ssh_host}",
-        "--", settings.ssh_executable, "-i", settings.ssh_interface or "", settings.target_mac,
+        settings.ssh_executable, *remote_arguments,
     ]
 
 
-def run_command(arguments: list[str], timeout: int) -> bool:
+def run_command(arguments: list[str], timeout: float) -> bool:
     try:
         result = subprocess.run(arguments, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout, check=False)
         return result.returncode == 0
@@ -208,16 +224,22 @@ def tcp_check(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
-def collect_status(settings: Settings) -> dict[str, object]:
+def collect_status(settings: Settings, timeout_seconds: float | None = None) -> dict[str, object]:
     checks: dict[str, bool] = {}
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+
+    def remaining(maximum: float) -> float:
+        return maximum if deadline is None else max(0.0, min(maximum, deadline - time.monotonic()))
+
     if settings.check_ping:
-        checks["ping"] = run_command(["/usr/bin/ping", "-c", "1", "-W", "1", settings.target_ip], 3)
+        timeout = remaining(3)
+        checks["ping"] = timeout > 0 and run_command(
+            ["/usr/bin/ping", "-c", "1", "-W", "1", settings.target_ip], timeout
+        )
     for port in settings.check_ports:
-        checks[f"tcp:{port}"] = tcp_check(settings.target_ip, port)
-    if settings.send_mode == "ssh":
-        checks["ssh_sender"] = run_command(build_ssh_command(settings)[:-5] + ["true"], 8)
-    reachability = [value for name, value in checks.items() if name != "ssh_sender"]
-    return {"online": any(reachability), "checks": checks}
+        timeout = remaining(2)
+        checks[f"tcp:{port}"] = timeout > 0 and tcp_check(settings.target_ip, port, timeout)
+    return {"online": any(checks.values()), "checks": checks}
 
 
 def send_wol(settings: Settings) -> bool:
@@ -237,19 +259,20 @@ class GatewayService:
     def __init__(
         self,
         settings: Settings,
-        status_collector: Callable[[], dict[str, object]] | None = None,
+        status_collector: Callable[[float | None], dict[str, object]] | None = None,
         wake_sender: Callable[[], bool] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.settings = settings
-        self.status_collector = status_collector or (lambda: collect_status(settings))
+        self.status_collector = status_collector or (lambda timeout=None: collect_status(settings, timeout))
         self.wake_sender = wake_sender or (lambda: send_wol(settings))
         self.sleep = sleep
         self.monotonic = monotonic
+        self.wake_lock = threading.Lock()
 
-    def _status_payload(self) -> dict[str, object]:
-        status = dict(self.status_collector())
+    def _status_payload(self, timeout_seconds: float | None = None) -> dict[str, object]:
+        status = dict(self.status_collector(timeout_seconds))
         return {"ok": True, "service": SERVICE_NAME, "target": self.settings.target_name, **status}
 
     def _authorized(self, authorization: str) -> bool:
@@ -265,26 +288,56 @@ class GatewayService:
         if path == "/status" and method == "GET":
             return 200, self._status_payload()
         if path == "/wol" and method == "POST":
-            before = self._status_payload()
-            if before["online"]:
-                return 200, {**before, "action": "wol", "result": "already_online"}
-            if not self.wake_sender():
-                return 502, {"ok": False, "service": SERVICE_NAME, "target": self.settings.target_name, "action": "wol", "error": "wol_failed"}
-            deadline = self.monotonic() + self.settings.wait_seconds
-            status = self._status_payload()
-            while not status["online"] and self.monotonic() < deadline:
-                self.sleep(self.settings.probe_interval_seconds)
-                status = self._status_payload()
-            if status["online"]:
-                return 200, {**status, "action": "wol", "result": "wol_sent_online"}
-            return 202, {**status, "action": "wol", "result": "wol_sent_waiting"}
+            if not self.wake_lock.acquire(blocking=False):
+                return 409, {"ok": False, "error": "wake_in_progress"}
+            try:
+                before = self._status_payload()
+                if before["online"]:
+                    return 200, {**before, "action": "wol", "result": "already_online"}
+                if not self.wake_sender():
+                    return 502, {"ok": False, "service": SERVICE_NAME, "target": self.settings.target_name, "action": "wol", "error": "wol_failed"}
+                deadline = self.monotonic() + self.settings.wait_seconds
+                status = before
+                while not status["online"]:
+                    remaining = deadline - self.monotonic()
+                    if remaining <= 0:
+                        break
+                    self.sleep(min(self.settings.probe_interval_seconds, remaining))
+                    remaining = deadline - self.monotonic()
+                    if remaining <= 0:
+                        break
+                    status = self._status_payload(remaining)
+                if status["online"]:
+                    return 200, {**status, "action": "wol", "result": "wol_sent_online"}
+                return 202, {**status, "action": "wol", "result": "wol_sent_waiting"}
+            finally:
+                self.wake_lock.release()
         return 405, {"ok": False, "error": "method_not_allowed"}
 
 
-class GatewayHTTPServer(ThreadingHTTPServer):
+class GatewayHTTPServer(ThreadingMixIn, HTTPServer):
+    request_queue_size = 8
+    daemon_threads = True
+    block_on_close = True
+
     def __init__(self, address: tuple[str, int], gateway: GatewayService) -> None:
+        self.worker_slots = threading.BoundedSemaphore(8)
         super().__init__(address, GatewayHandler)
         self.gateway = gateway
+
+    def process_request(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        self.worker_slots.acquire()
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.worker_slots.release()
+            raise
+
+    def process_request_thread(self, request: socket.socket, client_address: tuple[str, int]) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.worker_slots.release()
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -295,6 +348,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return
 
     def _respond(self, method: str) -> None:
+        started = time.monotonic()
         status, payload = self.server.gateway.handle(method, self.path, self.headers.get("Authorization", ""))  # type: ignore[attr-defined]
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
@@ -304,7 +358,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if method != "HEAD":
+            self.wfile.write(body)
+        print(json.dumps({"method": method, "path": urlparse(self.path).path, "status": status, "duration_ms": round((time.monotonic() - started) * 1000)}), flush=True)
 
     def do_GET(self) -> None:
         self._respond("GET")
@@ -318,6 +374,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
     do_DELETE = do_PUT
     do_PATCH = do_PUT
 
+    def do_HEAD(self) -> None:
+        self._respond("HEAD")
+
+    def do_OPTIONS(self) -> None:
+        self._respond("OPTIONS")
+
 
 def main() -> int:
     try:
@@ -325,6 +387,9 @@ def main() -> int:
     except ConfigurationError as error:
         print(f"Configuration error: {error}", flush=True)
         return 2
+    if settings.send_mode == "ssh" and not run_command(build_ssh_command(settings, "check"), 8):
+        print("Configuration error: SSH sender helper check failed", flush=True)
+        return 3
     GatewayHTTPServer((settings.bind, settings.port), GatewayService(settings)).serve_forever()
     return 0
 

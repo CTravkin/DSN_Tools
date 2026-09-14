@@ -19,6 +19,10 @@ ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+TasksMax=16
+MemoryMax=96M
 
 [Install]
 WantedBy=multi-user.target

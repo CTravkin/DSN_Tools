@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.machinery
 import importlib.util
 import os
-import pwd
 import shutil
 import socket
 import ssl
@@ -11,9 +10,19 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
+
+
+try:
+    import pwd
+except ModuleNotFoundError:
+    pwd = types.ModuleType("pwd")
+    pwd.getpwnam = lambda _name: (_ for _ in ()).throw(KeyError())
+    pwd.getpwuid = lambda _uid: (_ for _ in ()).throw(KeyError())
+    sys.modules["pwd"] = pwd
 
 
 SCRIPT_PATH = Path(
@@ -44,6 +53,8 @@ def get_acl(path: Path) -> set[str]:
 
 
 def available_acl_test_users() -> tuple[str, ...]:
+    if os.name != "posix":
+        return ()
     configured = os.environ.get("ACL_TEST_USERS", "")
     candidates = [item.strip() for item in configured.split(",") if item.strip()]
     if not candidates:
@@ -69,26 +80,41 @@ ACL_TESTS_AVAILABLE = (
 )
 
 
+def runtime_environment(**overrides: str) -> dict[str, str]:
+    temporary = Path(tempfile.gettempdir())
+    environment = {
+        "ACL_USERS": "alice",
+        "STATE_PATH": os.fspath(temporary / "acl-state.sqlite3"),
+        "TLS_CERTIFICATE": os.fspath(temporary / "syncthing-cert.pem"),
+        "FOLDER_ALLOWLIST": os.fspath(temporary / "folders.conf"),
+    }
+    environment.update(overrides)
+    return environment
+
+
 class RuntimeSettingsTests(unittest.TestCase):
     def test_environment_settings_are_parsed_without_local_identities(self) -> None:
+        temporary = Path(tempfile.gettempdir())
         settings = module.parse_runtime_settings(
             ["--scan"],
             {
                 "ACL_USERS": "alice,bob",
                 "SYNCTHING_USER": "sync-service",
-                "STATE_PATH": "/tmp/acl-state.sqlite3",
-                "TLS_CERTIFICATE": "/tmp/syncthing-cert.pem",
+                "STATE_PATH": os.fspath(temporary / "acl-state.sqlite3"),
+                "TLS_CERTIFICATE": os.fspath(temporary / "syncthing-cert.pem"),
+                "FOLDER_ALLOWLIST": os.fspath(temporary / "folders.conf"),
             },
         )
         self.assertEqual(("alice", "bob"), settings.acl_users)
         self.assertEqual("sync-service", settings.syncthing_user)
-        self.assertEqual(Path("/tmp/acl-state.sqlite3"), settings.state_path)
+        self.assertEqual(temporary / "acl-state.sqlite3", settings.state_path)
+        self.assertEqual(temporary / "folders.conf", settings.allowlist_path)
         self.assertTrue(settings.scan)
 
     def test_cli_values_override_environment_values(self) -> None:
         settings = module.parse_runtime_settings(
             ["--users", "carol,dave", "--refresh-hours", "6"],
-            {"ACL_USERS": "alice,bob", "REFRESH_HOURS": "3"},
+            runtime_environment(ACL_USERS="alice,bob", REFRESH_HOURS="3"),
         )
         self.assertEqual(("carol", "dave"), settings.acl_users)
         self.assertEqual(6, settings.refresh_hours)
@@ -96,7 +122,7 @@ class RuntimeSettingsTests(unittest.TestCase):
     def test_cli_interval_overrides_an_invalid_environment_value(self) -> None:
         settings = module.parse_runtime_settings(
             ["--users", "carol", "--refresh-hours", "6"],
-            {"REFRESH_HOURS": "not-an-integer"},
+            runtime_environment(REFRESH_HOURS="not-an-integer"),
         )
         self.assertEqual(6, settings.refresh_hours)
 
@@ -107,6 +133,45 @@ class RuntimeSettingsTests(unittest.TestCase):
     def test_relative_runtime_path_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "absolute"):
             module.parse_runtime_settings([], {"ACL_USERS": "alice", "STATE_PATH": "state.sqlite3"})
+
+    def test_env_file_supplies_one_shot_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            env_file = Path(temporary) / "settings.env"
+            env_file.write_text(
+                f"ACL_USERS=alice\nSTATE_PATH={temporary}/state.sqlite3\n"
+                f"TLS_CERTIFICATE={temporary}/cert.pem\n"
+                f"FOLDER_ALLOWLIST={temporary}/folders.conf\n",
+                encoding="utf-8",
+            )
+
+            settings = module.parse_runtime_settings(
+                ["--env-file", os.fspath(env_file), "--scan"],
+                {},
+            )
+
+        self.assertEqual(("alice",), settings.acl_users)
+        self.assertEqual(Path(temporary) / "folders.conf", settings.allowlist_path)
+        self.assertTrue(settings.scan)
+
+
+@unittest.skipUnless(os.name == "posix", "folder allowlist paths use POSIX semantics")
+class FolderAllowlistTests(unittest.TestCase):
+    def test_only_exact_folder_id_and_path_pairs_are_accepted(self) -> None:
+        allowlist = module.parse_folder_allowlist("documents=/srv/sync/documents\n")
+        configured = [module.FolderConfiguration("documents", Path("/srv/sync/documents"))]
+
+        self.assertEqual(configured, module.require_allowed_folders(configured, allowlist))
+
+        with self.assertRaisesRegex(ValueError, "not allowlisted"):
+            module.require_allowed_folders(
+                [module.FolderConfiguration("documents", Path("/etc"))],
+                allowlist,
+            )
+
+    def test_system_roots_are_rejected_even_when_listed(self) -> None:
+        for path in ("/", "/etc", "/usr/local", "/proc/1"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "system path"):
+                module.parse_folder_allowlist(f"folder={path}\n")
 
 
 class IgnoreMatcherTests(unittest.TestCase):
@@ -137,7 +202,7 @@ class IgnoreMatcherTests(unittest.TestCase):
         self.assertTrue(matcher.is_included("AGENTS.md"))
         self.assertTrue(matcher.is_included("agents/worker.md"))
         self.assertFalse(matcher.is_included("plugins/cache/data.json"))
-        self.assertFalse(matcher.directory_requires_access("plugins"))
+        self.assertEqual(module.AccessLevel.NONE, matcher.directory_access("plugins"))
 
     def test_blacklist_and_case_insensitive_patterns_are_honored(self) -> None:
         matcher = module.IgnoreMatcher(
@@ -153,7 +218,7 @@ class IgnoreMatcherTests(unittest.TestCase):
         )
 
         self.assertFalse(matcher.is_included("ignored/file.txt"))
-        self.assertTrue(matcher.directory_requires_access("ignored"))
+        self.assertEqual(module.AccessLevel.TRAVERSE, matcher.directory_access("ignored"))
 
     def test_first_match_and_glob_features_match_expanded_syncthing_patterns(self) -> None:
         matcher = module.IgnoreMatcher(
@@ -185,47 +250,64 @@ class IgnoreMatcherTests(unittest.TestCase):
             paths = module.discover_control_paths(root)
 
             self.assertEqual(
-                paths,
+                paths.files,
                 {
                     ".stignore",
-                    "rules",
                     "rules/first.ignore",
-                    "rules/nested",
                     "rules/nested/second.ignore",
                     ".stfolder",
                 },
             )
+            self.assertEqual(paths.parents, {"rules", "rules/nested"})
 
     def test_include_without_negation_does_not_enable_global_traversal(self) -> None:
         matcher = module.IgnoreMatcher(
             expanded_patterns=["private", "private/**"],
         )
 
-        self.assertFalse(matcher.directory_requires_access("private"))
+        self.assertEqual(module.AccessLevel.NONE, matcher.directory_access("private"))
 
     def test_ignore_before_unrooted_negation_can_still_skip_directory(self) -> None:
         matcher = module.IgnoreMatcher(
             expanded_patterns=["foo", "!**/baz", "*"],
         )
 
-        self.assertFalse(matcher.directory_requires_access("foo"))
-        self.assertTrue(matcher.directory_requires_access("other"))
+        self.assertEqual(module.AccessLevel.NONE, matcher.directory_access("foo"))
+        self.assertEqual(module.AccessLevel.TRAVERSE, matcher.directory_access("other"))
 
     def test_top_level_rooted_negation_scopes_traversal_to_its_directory(self) -> None:
         matcher = module.IgnoreMatcher(
             expanded_patterns=["!foo", "*"],
         )
 
-        self.assertTrue(matcher.directory_requires_access("foo"))
-        self.assertFalse(matcher.directory_requires_access("private"))
+        self.assertEqual(module.AccessLevel.FULL, matcher.directory_access("foo"))
+        self.assertEqual(module.AccessLevel.NONE, matcher.directory_access("private"))
+
+    def test_control_parent_traversal_is_a_floor_not_a_downgrade(self) -> None:
+        matcher = module.IgnoreMatcher([], control_parents={"rules"})
+
+        self.assertEqual(module.AccessLevel.FULL, matcher.directory_access("rules"))
+
+    def test_control_file_denial_wins_across_nested_policies(self) -> None:
+        root = Path("/srv/sync")
+        path = root / ".stignore"
+        policies = [
+            module.FolderPolicy("outer", root, module.IgnoreMatcher([])),
+            module.FolderPolicy("nested", root / ".stignore", module.IgnoreMatcher([])),
+        ]
+
+        self.assertEqual(
+            module.AccessLevel.NONE,
+            module.desired_for_policies(path, False, policies),
+        )
 
     def test_nested_rooted_negation_requires_global_traversal(self) -> None:
         matcher = module.IgnoreMatcher(
             expanded_patterns=["!foo/bar", "*"],
         )
 
-        self.assertTrue(matcher.directory_requires_access("foo"))
-        self.assertTrue(matcher.directory_requires_access("private"))
+        self.assertEqual(module.AccessLevel.TRAVERSE, matcher.directory_access("foo"))
+        self.assertEqual(module.AccessLevel.TRAVERSE, matcher.directory_access("private"))
 
     def test_symlinked_ignore_file_inside_root_is_a_control_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -238,10 +320,8 @@ class IgnoreMatcherTests(unittest.TestCase):
 
             paths = module.discover_control_paths(root)
 
-            self.assertEqual(
-                paths,
-                {".stignore", "rules", "rules/real.ignore", ".stfolder"},
-            )
+            self.assertEqual(paths.files, {".stignore", "rules/real.ignore", ".stfolder"})
+            self.assertEqual(paths.parents, {"rules"})
 
     def test_symlinked_ignore_file_outside_root_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -283,10 +363,31 @@ class ApiTransportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             module.normalize_gui_https("127.0.0.1:8384", use_tls=False)
 
+    def test_duplicate_syncthing_folder_id_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            config = base / "config.xml"
+            config.write_text(
+                """
+                <configuration>
+                  <gui enabled="true" tls="true">
+                    <address>127.0.0.1:8384</address><apikey>secret</apikey>
+                  </gui>
+                  <folder id="documents" path="first" />
+                  <folder id="documents" path="second" />
+                </configuration>
+                """,
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "Duplicate Syncthing folder ID"):
+                module.read_configuration(config, base)
+
     def test_hostname_alias_is_rejected_even_when_named_localhost(self) -> None:
         with self.assertRaises(ValueError):
             module.normalize_gui_https("localhost:8384", use_tls=True)
 
+    @unittest.skipUnless(shutil.which("openssl"), "requires openssl")
     def test_mismatched_pinned_certificate_rejects_connection_before_api_key_is_sent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -365,7 +466,7 @@ class AclReconciliationTests(unittest.TestCase):
     def acl_entry(self, user: str, permissions: str) -> str:
         return f"user:{user}:{permissions}"
 
-    def test_nested_rooted_negation_keeps_unrelated_ignored_directory_traversable(self) -> None:
+    def test_nested_rooted_negation_grants_only_traversal_to_ignored_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             root = base / "folder"
@@ -380,7 +481,47 @@ class AclReconciliationTests(unittest.TestCase):
             self.assertEqual(stats.failed, 0)
             entries = get_acl(private)
             for user in ACL_TEST_USERS:
-                self.assertIn(self.acl_entry(user, "rwx"), entries)
+                self.assertIn(self.acl_entry(user, "--x"), entries)
+
+    def test_control_file_does_not_receive_managed_access(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "folder"
+            root.mkdir()
+            control = root / ".stignore"
+            control.write_text("*.tmp\n", encoding="utf-8")
+            for user in ACL_TEST_USERS:
+                subprocess.run(("setfacl", "-m", f"u:{user}:rw", "--", os.fspath(control)), check=True)
+            matcher = module.IgnoreMatcher([], control_files={".stignore", ".stfolder"})
+            state = module.StateStore(base / "state.sqlite3")
+
+            stats = module.reconcile_root(root, matcher, state, force=True)
+
+            self.assertEqual(0, stats.failed)
+            entries = get_acl(control)
+            for user in ACL_TEST_USERS:
+                self.assertFalse(any(item.startswith(f"user:{user}:") for item in entries))
+
+    def test_changed_managed_users_reconciles_cached_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            path = base / "document.txt"
+            path.write_text("data", encoding="utf-8")
+            state = module.StateStore(base / "state.sqlite3")
+            original_users = module.ACL_USERS
+            try:
+                module.ACL_USERS = (ACL_TEST_USERS[0],)
+                first = module.reconcile_path(path, module.AccessLevel.FULL, state, allowed_roots=[base])
+                module.ACL_USERS = (ACL_TEST_USERS[1],)
+                second = module.reconcile_path(path, module.AccessLevel.FULL, state, allowed_roots=[base])
+            finally:
+                module.ACL_USERS = original_users
+                state.close()
+
+            self.assertEqual(1, second.acl_reads)
+            entries = get_acl(path)
+            self.assertFalse(any(item.startswith(f"user:{ACL_TEST_USERS[0]}:") for item in entries))
+            self.assertIn(self.acl_entry(ACL_TEST_USERS[1], "rw-"), entries)
 
     def test_excluded_directory_loses_named_acl_but_owner_keeps_access(self) -> None:
         for owner_name in ACL_TEST_USERS:
@@ -543,6 +684,50 @@ class AclReconciliationTests(unittest.TestCase):
                 with self.assertRaises(module.UnsafePathError):
                     managed_root.open_target(root / "escape" / "target")
 
+    def test_final_symlink_keeps_managed_revoke_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            root.mkdir()
+            path = root / "file"
+            path.write_text("data", encoding="utf-8")
+            state = module.StateStore(base / "state.sqlite3")
+            module.reconcile_path(path, module.AccessLevel.FULL, state, force=True, allowed_roots=[root])
+            moved = root / "moved"
+            path.rename(moved)
+            path.symlink_to(moved.name)
+
+            stats = module.reconcile_path(
+                path, module.AccessLevel.FULL, state, force=True, allowed_roots=[root]
+            )
+
+            self.assertEqual(1, stats.failed)
+            self.assertIsNotNone(state.get(path))
+            state.close()
+
+    def test_replaced_inode_is_not_granted_or_used_for_revoke(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            root = base / "root"
+            root.mkdir()
+            path = root / "file"
+            path.write_text("original", encoding="utf-8")
+            state = module.StateStore(base / "state.sqlite3")
+            module.reconcile_path(path, module.AccessLevel.FULL, state, force=True, allowed_roots=[root])
+            previous = state.get(path)
+            path.rename(base / "moved")
+            path.write_text("replacement", encoding="utf-8")
+
+            with mock.patch.object(module, "set_managed_access") as set_access:
+                stats = module.reconcile_path(
+                    path, module.AccessLevel.NONE, state, force=True, allowed_roots=[root]
+                )
+
+            self.assertEqual(1, stats.failed)
+            self.assertEqual(previous, state.get(path))
+            set_access.assert_not_called()
+            state.close()
+
     def test_failed_acl_read_is_not_cached_and_next_pass_retries(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -587,7 +772,7 @@ class AclReconciliationTests(unittest.TestCase):
             self.assertEqual(second.acl_reads, 0)
             self.assertEqual(second.changed, 0)
 
-    def test_replaced_former_root_is_reported_once_and_removed_from_active_state(self) -> None:
+    def test_replaced_former_root_is_reported_once_and_retained_for_manual_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
             root = base / "folder"
@@ -613,10 +798,118 @@ class AclReconciliationTests(unittest.TestCase):
                 if "Former managed root identity changed" in str(call)
             ]
             self.assertEqual(len(warnings), 1)
-            self.assertEqual(list(state.iter_items()), [])
+            self.assertEqual(len(list(state.iter_items())), 41)
+
+
+class StateMigrationTests(unittest.TestCase):
+    def test_legacy_state_is_migrated_without_losing_revoke_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.sqlite3"
+            managed_path = Path(temporary) / "folder" / "file"
+            anchor = Path(temporary) / "folder"
+            anchor.mkdir()
+            managed_path.write_text("data", encoding="utf-8")
+            metadata = managed_path.stat()
+            connection = module.sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE paths (path TEXT PRIMARY KEY, ctime_ns INTEGER NOT NULL, "
+                "desired INTEGER NOT NULL, anchor TEXT NOT NULL, anchor_dev INTEGER NOT NULL, "
+                "anchor_ino INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO paths VALUES (?, ?, ?, ?, ?, ?)",
+                (os.fspath(managed_path), 123, 1, os.fspath(anchor), 10, 20),
+            )
+            connection.commit()
+            connection.close()
+            previous_users = module.LEGACY_ACL_USERS
+            module.LEGACY_ACL_USERS = ("old-user",)
+            try:
+                state = module.StateStore(path)
+                record = state.get(managed_path)
+                state.close()
+            finally:
+                module.LEGACY_ACL_USERS = previous_users
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(module.AccessLevel.FULL, record.access)
+        self.assertEqual(("old-user",), record.users)
+        self.assertEqual(
+            (module.sqlite_identity(metadata.st_dev), module.sqlite_identity(metadata.st_ino)),
+            (record.target_dev, record.target_ino),
+        )
+
+    def test_legacy_managed_state_requires_explicit_previous_users(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.sqlite3"
+            managed_path = Path(temporary) / "file"
+            managed_path.write_text("data", encoding="utf-8")
+            connection = module.sqlite3.connect(path)
+            connection.execute(
+                "CREATE TABLE paths (path TEXT PRIMARY KEY, ctime_ns INTEGER NOT NULL, "
+                "desired INTEGER NOT NULL, anchor TEXT NOT NULL, anchor_dev INTEGER NOT NULL, "
+                "anchor_ino INTEGER NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO paths VALUES (?, ?, ?, ?, ?, ?)",
+                (os.fspath(managed_path), 123, 1, os.fspath(Path(temporary)), 10, 20),
+            )
+            connection.commit()
+            connection.close()
+            previous_users = module.LEGACY_ACL_USERS
+            module.LEGACY_ACL_USERS = ()
+            try:
+                with self.assertRaisesRegex(ValueError, "LEGACY_ACL_USERS"):
+                    module.StateStore(path)
+            finally:
+                module.LEGACY_ACL_USERS = previous_users
+
+    def test_managed_record_detects_replaced_inode(self) -> None:
+        record = module.StateRecord(
+            1, module.AccessLevel.FULL, Path("/managed"), 1, 2, 3, 4, ("alice",), False
+        )
+        self.assertTrue(module.record_has_managed_acl(record))
+        self.assertTrue(module.target_identity_changed(record, 3, 5))
+        self.assertFalse(module.target_identity_changed(record, 3, 4))
+
+    def test_unknown_state_schema_is_rejected_without_dropping_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "state.sqlite3"
+            connection = module.sqlite3.connect(path)
+            connection.execute("CREATE TABLE paths (path TEXT PRIMARY KEY, mystery TEXT)")
+            connection.execute("INSERT INTO paths VALUES ('sentinel', 'keep')")
+            connection.commit()
+            connection.close()
+
+            with self.assertRaisesRegex(ValueError, "Unsupported state database schema"):
+                module.StateStore(path)
+
+            connection = module.sqlite3.connect(path)
+            row = connection.execute("SELECT path, mystery FROM paths").fetchone()
+            connection.close()
+
+        self.assertEqual(("sentinel", "keep"), row)
 
 
 class EventReliabilityTests(unittest.TestCase):
+    def test_folder_events_are_blocked_while_policy_reload_is_pending(self) -> None:
+        self.assertFalse(module.folder_event_reconciliation_allowed(policy_dirty=True))
+        self.assertTrue(module.folder_event_reconciliation_allowed(policy_dirty=False))
+
+    def test_walk_error_marks_reconciliation_failed(self) -> None:
+        stats = module.ReconcileStats()
+
+        def fail_walk(_root: Path, **options: object):
+            options["onerror"](PermissionError("denied"))
+            return iter(())
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(module.os, "walk", side_effect=fail_walk):
+                self.assertEqual([], list(module.walk_paths(Path(temporary), stats)))
+
+        self.assertEqual(1, stats.failed)
+
     def test_queue_overflow_requires_full_reconciliation(self) -> None:
         self.assertTrue(module.events_require_full_reconciliation({"Q_OVERFLOW"}))
 

@@ -1,27 +1,21 @@
 # Windows Icon Recovery
 
-[English](README.md) | [Русский](README.ru.md)
+[English](README.md) | [Русский](README.ru.md) | [DSN Tools](../README.md)
 
-[Back to DSN Tools](../README.md)
+Windows Icon Recovery captures, audits, restores, and rolls back folder `IconResource` and shortcut `.lnk` `IconLocation` assignments from a versioned JSON manifest.
 
-Captures, audits, and restores folder `IconResource` and shortcut `.lnk` `IconLocation` values from a versioned JSON manifest.
-
-Restoration changes only missing or empty assignments. A different non-empty icon is reported as a conflict. Every changed file is backed up with a SHA-256 checksum before writing, and the result is audited afterward.
-
-## Stack
-
-Windows PowerShell 5.1, Windows Shell COM automation, and Explorer shell notifications.
+Restore is fail-closed: every target and icon-source file is checked before any write. Missing assignments and incorrect Explorer attributes are repairable; a different non-empty icon is a conflict and nothing is changed. Every affected file and its attributes are backed up before restoration.
 
 ## Requirements
 
-- Windows 10 or 11
-- Permission to update the target `desktop.ini`, shortcut, and file attributes
+- Windows 10 or 11 and Windows PowerShell 5.1
+- Permission to update target folders, `desktop.ini`, `.lnk` files, and their attributes
 - Absolute target and icon-source paths after environment expansion
-- A writable backup directory for restoration
+- A writable backup directory
 
-## Data exchange
+The tool verifies that an icon source file exists. It does not validate that a requested resource index exists inside an EXE or DLL.
 
-The manifest uses this schema:
+## Manifest
 
 ```json
 {
@@ -35,51 +29,54 @@ The manifest uses this schema:
 }
 ```
 
-Targets must be unique. Environment variables remain unexpanded in the manifest. See [`examples/icon-manifest.example.json`](examples/icon-manifest.example.json).
+The manifest must contain at least one unique target. Paths may retain environment variables for portability. Manifests normally contain machine-specific paths; review them before committing or sharing. See [`examples/icon-manifest.example.json`](examples/icon-manifest.example.json).
 
-Commands return structured JSON. Audit and restore results include problem or conflict details.
-
-## Operations
-
-### Usage
-
-#### Capture
+## Capture and audit
 
 ```powershell
 .\Export-IconManifest.ps1 `
   -OutputPath .\icons.json `
   -Folder '%USERPROFILE%\Example' `
   -Shortcut '%USERPROFILE%\Desktop\Example.lnk'
-```
 
-#### Audit
-
-```powershell
 .\Test-IconAssignments.ps1 -ManifestPath .\icons.json
 ```
 
-Exit code `0` means no problems; `1` means a problem or input error was found.
+Audit exits `0` when the manifest matches and `1` for any problem or input error. Output is JSON with per-target details.
 
-#### Restore
+## Restore and rollback
+
+Preview a restore, then apply it:
 
 ```powershell
+.\Restore-IconAssignments.ps1 `
+  -ManifestPath .\icons.json `
+  -BackupRoot "$env:USERPROFILE\Icon Recovery Backups" `
+  -WhatIf
+
 .\Restore-IconAssignments.ps1 `
   -ManifestPath .\icons.json `
   -BackupRoot "$env:USERPROFILE\Icon Recovery Backups"
 ```
 
-Exit code `0` means the restored state passed verification. Code `2` means a missing target or conflicting assignment; code `1` means an error or failed verification.
+Restore exits `0` after a successful verification, `2` when preflight finds a conflict, missing target, or missing icon source, and `1` on an execution or post-verification failure. A mid-operation failure triggers automatic rollback.
 
-The returned backup directory contains a manifest and copies of changed files. To roll back, verify the recorded checksum and restore each copy to its `sourceFile`; remove files whose `existed` value is `false`. Folder attributes may need separate rollback because restoration can add the `ReadOnly` flag required by Explorer.
+The returned backup path contains copied files, SHA-256 hashes, and original file/folder attributes. Roll it back explicitly with:
 
-### Verification
+```powershell
+.\Undo-IconRecovery.ps1 -BackupPath 'C:\Path\To\Backup'
+```
+
+Both restore and rollback support `-WhatIf` and `-Confirm`. Explorer receives item-level change notifications; the utility does not clear the icon cache or restart Explorer.
+
+## Test
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-IconRecovery.ps1
 ```
 
-## Limitations
+## Troubleshooting
 
-- Missing icon source files are reported but not restored
-- Conflicting non-empty assignments are not overwritten
-- Explorer may retain a visual cache after receiving an item refresh notification
+- `IconConflict`: change the manifest intentionally or clear the assignment yourself; the utility will not overwrite it
+- `AttributeMismatch`: run restore to repair `desktop.ini` Hidden/System and folder ReadOnly flags
+- An unchanged visible icon can be an Explorer cache delay; reopen the folder before considering broader cache repair

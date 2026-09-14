@@ -29,10 +29,40 @@ internal static class TrayLauncher
     [DllImport("user32.dll")] private static extern bool ShowWindowAsync(IntPtr window, int command);
     [DllImport("user32.dll")] private static extern bool BringWindowToTop(IntPtr window);
     [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr window);
+    [DllImport("user32.dll")] private static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint attach, uint attachTo, bool value);
     [DllImport("user32.dll")] private static extern bool SetCursorPos(int x, int y);
-    [DllImport("user32.dll")] private static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
+    [DllImport("user32.dll")] private static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll", SetLastError=true)] private static extern uint SendInput(uint count, Input[] inputs, int size);
 
-    private static string Json(string value) { return "\"" + (value ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""; }
+    [StructLayout(LayoutKind.Sequential)] private struct Point { public int X; public int Y; }
+    [StructLayout(LayoutKind.Sequential)] private struct MouseInput { public int X; public int Y; public uint Data; public uint Flags; public uint Time; public UIntPtr ExtraInfo; }
+    [StructLayout(LayoutKind.Sequential)] private struct Input { public uint Type; public MouseInput Mouse; }
+
+    private static string Json(string value)
+    {
+        StringBuilder result = new StringBuilder("\"");
+        foreach (char character in value ?? "")
+        {
+            switch (character)
+            {
+                case '\"': result.Append("\\\""); break;
+                case '\\': result.Append("\\\\"); break;
+                case '\b': result.Append("\\b"); break;
+                case '\f': result.Append("\\f"); break;
+                case '\n': result.Append("\\n"); break;
+                case '\r': result.Append("\\r"); break;
+                case '\t': result.Append("\\t"); break;
+                default:
+                    if (character < 0x20 || character == 0x2028 || character == 0x2029 || Char.IsSurrogate(character))
+                        result.Append("\\u").Append(((int)character).ToString("x4"));
+                    else result.Append(character);
+                    break;
+            }
+        }
+        return result.Append('\"').ToString();
+    }
 
     private static bool Matches(IntPtr window)
     {
@@ -54,41 +84,97 @@ internal static class TrayLauncher
     private static bool Activate(IntPtr window)
     {
         if (window == IntPtr.Zero) return false;
-        ShowWindowAsync(window, IsIconic(window) ? 9 : 5); BringWindowToTop(window); return SetForegroundWindow(window);
+        ShowWindowAsync(window, IsIconic(window) ? 9 : 5);
+        IntPtr foreground = GetForegroundWindow();
+        uint ignored;
+        uint foregroundThread = foreground == IntPtr.Zero ? 0 : GetWindowThreadProcessId(foreground, out ignored);
+        uint currentThread = GetCurrentThreadId();
+        bool attached = foregroundThread != 0 && foregroundThread != currentThread && AttachThreadInput(currentThread, foregroundThread, true);
+        try { BringWindowToTop(window); return SetForegroundWindow(window); }
+        finally { if (attached) AttachThreadInput(currentThread, foregroundThread, false); }
     }
 
-    private static AutomationElement FindElement(ControlType type, string name)
+    private static AutomationElement FindTrayIcon()
     {
-        Condition condition = new AndCondition(new PropertyCondition(AutomationElement.ControlTypeProperty, type), new PropertyCondition(AutomationElement.NameProperty, name));
-        return AutomationElement.RootElement.FindFirst(TreeScope.Descendants, condition);
+        Condition trayWindow = new OrCondition(
+            new PropertyCondition(AutomationElement.ClassNameProperty, "Shell_TrayWnd"),
+            new PropertyCondition(AutomationElement.ClassNameProperty, "NotifyIconOverflowWindow"));
+        Condition icon = new AndCondition(
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Button),
+            new PropertyCondition(AutomationElement.NameProperty, TrayIconName));
+        AutomationElementCollection roots = AutomationElement.RootElement.FindAll(TreeScope.Children, trayWindow);
+        foreach (AutomationElement root in roots)
+        {
+            AutomationElement match = root.FindFirst(TreeScope.Descendants, icon);
+            if (match != null) return match;
+        }
+        return null;
     }
 
-    private static AutomationElement FindTrayIcon() { return FindElement(ControlType.Button, TrayIconName); }
+    private static AutomationElement FindMenuItem(System.Windows.Point origin)
+    {
+        Condition menus = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu);
+        Condition itemCondition = new AndCondition(
+            new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
+            new PropertyCondition(AutomationElement.NameProperty, TrayMenuItemName));
+        AutomationElement best = null;
+        double bestDistance = Double.MaxValue;
+        foreach (AutomationElement menu in AutomationElement.RootElement.FindAll(TreeScope.Descendants, menus))
+        {
+            AutomationElement item = menu.FindFirst(TreeScope.Descendants, itemCondition);
+            if (item == null || !item.Current.IsEnabled || item.Current.IsOffscreen) continue;
+            System.Windows.Rect rectangle = menu.Current.BoundingRectangle;
+            double dx = origin.X < rectangle.Left ? rectangle.Left-origin.X : (origin.X > rectangle.Right ? origin.X-rectangle.Right : 0);
+            double dy = origin.Y < rectangle.Top ? rectangle.Top-origin.Y : (origin.Y > rectangle.Bottom ? origin.Y-rectangle.Bottom : 0);
+            double distance = dx*dx + dy*dy;
+            if (distance < bestDistance) { best=item; bestDistance=distance; }
+        }
+        return best;
+    }
+
+    private static bool RightClick(int x, int y)
+    {
+        Point original;
+        if (!GetCursorPos(out original) || !SetCursorPos(x, y)) return false;
+        try
+        {
+            Input[] inputs = {
+                new Input { Type=0, Mouse=new MouseInput { Flags=0x0008 } },
+                new Input { Type=0, Mouse=new MouseInput { Flags=0x0010 } }
+            };
+            return SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(Input))) == (uint)inputs.Length;
+        }
+        finally { SetCursorPos(original.X, original.Y); }
+    }
 
     private static bool OpenFromTray()
     {
         for (int attempt=0; attempt<RetryCount; attempt++)
         {
-            AutomationElement icon = FindTrayIcon();
-            if (icon != null)
+            try
             {
-                System.Windows.Point point;
-                if (icon.TryGetClickablePoint(out point) && SetCursorPos((int)point.X, (int)point.Y))
+                AutomationElement icon = FindTrayIcon();
+                if (icon != null)
                 {
-                    mouse_event(0x0008,0,0,0,UIntPtr.Zero); mouse_event(0x0010,0,0,0,UIntPtr.Zero);
-                    Thread.Sleep(RetryDelayMilliseconds);
-                    AutomationElement item = FindElement(ControlType.MenuItem, TrayMenuItemName);
-                    if (item != null && item.Current.IsEnabled)
+                    System.Windows.Point point;
+                    if (icon.TryGetClickablePoint(out point) && RightClick((int)point.X, (int)point.Y))
                     {
-                        object pattern;
-                        if (item.TryGetCurrentPattern(InvokePattern.Pattern, out pattern))
+                        Thread.Sleep(RetryDelayMilliseconds);
+                        AutomationElement item = FindMenuItem(point);
+                        if (item != null)
                         {
-                            ((InvokePattern)pattern).Invoke();
-                            for (int wait=0; wait<RetryCount; wait++) { Thread.Sleep(RetryDelayMilliseconds); IntPtr window=FindWindow(); if (window!=IntPtr.Zero) return Activate(window); }
+                            object pattern;
+                            if (item.TryGetCurrentPattern(InvokePattern.Pattern, out pattern))
+                            {
+                                ((InvokePattern)pattern).Invoke();
+                                for (int wait=0; wait<RetryCount; wait++) { Thread.Sleep(RetryDelayMilliseconds); IntPtr window=FindWindow(); if (window!=IntPtr.Zero) return Activate(window); }
+                            }
                         }
                     }
                 }
             }
+            catch (ElementNotAvailableException) { }
+            catch (InvalidOperationException) { }
             Thread.Sleep(RetryDelayMilliseconds);
         }
         return false;
@@ -105,8 +191,10 @@ internal static class TrayLauncher
             Console.WriteLine("{\"targetPath\":"+Json(expandedTarget)+",\"arguments\":"+Json(FixedArguments)+",\"processName\":"+Json(ProcessName)+",\"windowClass\":"+Json(WindowClass)+",\"windowTitle\":"+Json(WindowTitle)+",\"trayIconName\":"+Json(TrayIconName)+",\"trayMenuItemName\":"+Json(TrayMenuItemName)+",\"retryCount\":"+RetryCount+",\"retryDelayMilliseconds\":"+RetryDelayMilliseconds+"}"); return 0;
         }
         IntPtr window = FindWindow();
-        string action = DetermineAction(window!=IntPtr.Zero, FindTrayIcon()!=null);
-        if (action=="activate") return Activate(window) ? 0 : 3;
+        if (window!=IntPtr.Zero) return Activate(window) ? 0 : 3;
+        bool hasTrayIcon = false;
+        try { hasTrayIcon = FindTrayIcon()!=null; } catch (ElementNotAvailableException) { } catch (InvalidOperationException) { }
+        string action = DetermineAction(false, hasTrayIcon);
         if (action=="open-tray") return OpenFromTray() ? 0 : 4;
         if (!File.Exists(expandedTarget)) { MessageBox.Show("Executable not found:\r\n"+expandedTarget,"Tray App Launcher",MessageBoxButtons.OK,MessageBoxIcon.Error); return 2; }
         try { Process.Start(new ProcessStartInfo { FileName=expandedTarget, Arguments=FixedArguments, WorkingDirectory=Path.GetDirectoryName(expandedTarget), UseShellExecute=false }); return 0; }

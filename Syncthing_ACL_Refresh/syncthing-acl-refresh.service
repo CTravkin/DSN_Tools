@@ -14,6 +14,18 @@ IOSchedulingClass=idle
 UMask=0077
 KillMode=mixed
 TimeoutStopSec=15s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
 
 [Install]
 WantedBy=multi-user.target

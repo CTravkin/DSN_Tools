@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+set -f
+export LC_ALL=C
+
+if [ "$#" -eq 0 ] && [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+    previous_ifs=$IFS
+    IFS=' '
+    set -- $SSH_ORIGINAL_COMMAND
+    IFS=$previous_ifs
+    case "${1:-}" in
+        */remote-wol-sender|remote-wol-sender) shift ;;
+        *) exit 2 ;;
+    esac
+fi
+
+action=${1:-}
+interface=${2:-}
+case "$interface" in
+    ''|*[!A-Za-z0-9_.:-]*) exit 2 ;;
+esac
+
+ether_wake=/usr/sbin/ether-wake
+ip_command=/usr/sbin/ip
+
+case "$action" in
+    --check)
+        [ "$#" -eq 2 ] || exit 2
+        [ -x "$ether_wake" ]
+        "$ip_command" link show dev "$interface" >/dev/null 2>&1
+        ;;
+    --wake)
+        [ "$#" -eq 3 ] || exit 2
+        printf '%s\n' "$3" | grep -Eq '^[0-9A-Fa-f]{2}([:-][0-9A-Fa-f]{2}){5}$' || exit 2
+        exec "$ether_wake" -i "$interface" "$3"
+        ;;
+    *) exit 2 ;;
+esac

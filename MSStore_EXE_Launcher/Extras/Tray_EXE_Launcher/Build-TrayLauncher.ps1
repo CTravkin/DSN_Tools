@@ -10,7 +10,8 @@ param(
     [string]$WindowTitle = '',
     [ValidateRange(1,20)][int]$RetryCount = 5,
     [ValidateRange(50,5000)][int]$RetryDelayMilliseconds = 400,
-    [string]$IconPath
+    [string]$IconPath,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -25,5 +26,5 @@ $replacement = @{
     TRAY_MENU_ITEM_NAME=(ConvertTo-CSharpLiteral $TrayMenuItemName); RETRY_COUNT=[string]$RetryCount; RETRY_DELAY=[string]$RetryDelayMilliseconds
 }
 $references = @('System.Windows.Forms.dll',(Resolve-FrameworkAssembly 'UIAutomationClient'),(Resolve-FrameworkAssembly 'UIAutomationTypes'),(Resolve-FrameworkAssembly 'WindowsBase'))
-$result = Invoke-TemplateLauncherBuild -TemplatePath (Join-Path $PSScriptRoot 'TrayLauncher.cs.template') -OutputPath $OutputPath -Replacement $replacement -Reference $references -IconPath $IconPath
+$result = Invoke-TemplateLauncherBuild -TemplatePath (Join-Path $PSScriptRoot 'TrayLauncher.cs.template') -OutputPath $OutputPath -Replacement $replacement -Reference $references -IconPath $IconPath -Force:$Force
 Write-Output "Built tray launcher: $result"

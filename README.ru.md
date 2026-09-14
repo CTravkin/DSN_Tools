@@ -2,13 +2,15 @@
 
 [English](README.md) | [Русский](README.ru.md)
 
-Утилиты для системного администрирования и автоматизации рабочего стола Windows.
+Небольшие утилиты для повторяющихся системных и пользовательских задач.
 
-## Компоненты
+## Утилиты
 
-| Компонент | Тип | Платформа | Назначение |
-|---|---|---|---|
-| [Syncthing ACL Refresh](Syncthing_ACL_Refresh/README.ru.md) · `Syncthing_ACL_Refresh/` | Worker | Linux | Синхронизирует POSIX ACL с папками и правилами исключения Syncthing |
-| [Remote WoL Gateway](Remote_WoL_Gateway/README.ru.md) · `Remote_WoL_Gateway/` | Backend | Linux | Предоставляет аутентифицированный HTTP-шлюз для пробуждения одной машины |
-| [Windows Icon Recovery](Windows_Icon_Recovery/README.ru.md) · `Windows_Icon_Recovery/` | Tool | Windows | Сохраняет, проверяет, резервирует и восстанавливает иконки папок и ярлыков |
-| [MSStore EXE Launcher](MSStore_EXE_Launcher/README.ru.md) · `MSStore_EXE_Launcher/` | Tool | Windows | Собирает автономные лаунчеры для пакетных, настольных и tray-приложений |
+| Утилита | Платформа | Назначение |
+|---|---|---|
+| [Syncthing ACL Refresh](Syncthing_ACL_Refresh/README.ru.md) | Linux | Синхронизирует именованные записи POSIX ACL с папками и правилами исключения Syncthing |
+| [Remote WoL Gateway](Remote_WoL_Gateway/README.ru.md) | Linux | Предоставляет аутентифицированный API для проверки и пробуждения одной машины |
+| [Windows Icon Recovery](Windows_Icon_Recovery/README.ru.md) | Windows | Сохраняет, проверяет, резервирует, восстанавливает и откатывает иконки папок и ярлыков |
+| [MSStore EXE Launcher](MSStore_EXE_Launcher/README.ru.md) | Windows | Собирает EXE-лаунчеры пакетных приложений и дополнительные desktop- и tray-варианты |
+
+Каждая директория самодостаточна. Требования, конфигурация, команды и ограничения описаны в ее README.

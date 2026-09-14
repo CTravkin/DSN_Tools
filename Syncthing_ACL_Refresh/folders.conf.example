@@ -1,0 +1,2 @@
+# Exact Syncthing folder ID and absolute path, one per line.
+documents=/srv/syncthing/documents

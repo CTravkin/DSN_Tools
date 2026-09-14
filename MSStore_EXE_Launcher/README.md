@@ -1,53 +1,41 @@
 # MSStore EXE Launcher
 
-[English](README.md) | [Русский](README.ru.md)
+[English](README.md) | [Русский](README.ru.md) | [DSN Tools](../README.md)
 
-[Back to DSN Tools](../README.md)
+MSStore EXE Launcher builds a small standalone EXE that opens a packaged Windows application by its exact application user model ID (AUMID). This is useful where a tool accepts executable paths but cannot launch `shell:AppsFolder` entries directly.
 
-Builds standalone Windows executables for packaged, desktop, and tray applications.
-
-## Features
-
-- Launches a packaged application by exact AUMID or unique `Get-StartApps` name
-- Activates an existing desktop window before starting another process
-- Invokes a configured tray action when no usable window exists
-
-## Stack
-
-Windows PowerShell 5.1, .NET Framework C# compiler, Win32 window APIs, and UI Automation.
+The main builder targets packaged applications. [`Extras`](Extras/) retains two narrower techniques for ordinary desktop applications: activating an existing window and invoking a tray-menu action before starting another process.
 
 ## Requirements
 
-- Windows 10 or 11
-- `csc.exe` under `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319` or `Framework\v4.0.30319`
-- Main builder: an exact AUMID or unique registered application name
-- Desktop and tray builders: an absolute executable path and process name
-- Tray builder: exact accessible icon and menu-item names in the active Windows language
-- Optional existing `.ico` file
+- Windows 10 or 11 and Windows PowerShell 5.1
+- .NET Framework C# compiler under `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319` or `Framework\v4.0.30319`
+- Optional existing `.ico` file for the generated EXE
+- Tray mode: exact UI Automation names in the current Windows display language
 
-Build-time values remain visible inside the generated executable. Do not embed secrets.
+Build-time values are embedded in the EXE and visible to anyone who can inspect it. Do not use them for secrets.
 
-## Operations
+## Packaged application launcher
 
-### Build
-
-#### MS Store launcher
+List registered names and AUMIDs with `Get-StartApps`, then build by exact AUMID:
 
 ```powershell
+Get-StartApps
 .\Build-Launcher.ps1 `
   -AppId 'Example.Package_123!App' `
   -OutputPath "$env:USERPROFILE\Desktop\Example.exe" `
   -IconPath 'C:\Path\Example.ico'
 ```
 
-An installed application can also be selected by exact unique name:
+An exact unique registered name can be used instead:
 
 ```powershell
-Get-StartApps
 .\Build-Launcher.ps1 -AppName 'Exact registered name' -OutputPath '.\Example.exe'
 ```
 
-#### Desktop launcher
+The builder rejects malformed or ambiguous AUMIDs. Existing output is not replaced unless `-Force` is supplied. The generated EXE returns `0` after handing the request to the Windows shell and `1` if launch setup fails. `--print-aumid` prints the embedded ID without launching.
+
+## Extra: desktop window launcher
 
 ```powershell
 .\Extras\Desktop_EXE_Launcher\Build-DesktopLauncher.ps1 `
@@ -59,9 +47,9 @@ Get-StartApps
   -OutputPath '.\Example Desktop.exe'
 ```
 
-`WindowClass` and `WindowTitle` are optional. `-IncludeHiddenWindow` allows a hidden matching window.
+The launcher activates the first matching top-level window or starts the configured executable. `WindowClass` and `WindowTitle` are optional; `-IncludeHiddenWindow` permits hidden matches. Exit codes: `0` success, `1` start failure, `2` missing target, `3` Windows rejected foreground activation.
 
-#### Tray launcher
+## Extra: tray action launcher
 
 ```powershell
 .\Extras\Tray_EXE_Launcher\Build-TrayLauncher.ps1 `
@@ -72,18 +60,22 @@ Get-StartApps
   -OutputPath '.\Example Tray.exe'
 ```
 
-Optional parameters set window filters, fixed arguments, retry count, retry delay, and icon.
+If no matching window exists, the launcher looks only in Windows notification areas, opens the matching icon's context menu, invokes the nearest matching menu item, and restores the pointer position. If neither a window nor tray icon exists, it starts the process. Exit code `4` means the tray action or resulting activation failed; codes `0`–`3` match desktop mode.
 
-### Verification
+Desktop and tray launchers support `--print-config`. All builders accept `-Force` for deliberate replacement.
 
-Generated Store launchers support `--print-aumid`; desktop and tray launchers support `--print-config`.
+## Test and remove
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-LauncherBuilders.ps1
 ```
 
-## Limitations
+The tests compile all three variants and verify embedded configuration and decision logic. They do not automate a real installed Store application or notification icon.
 
-- Window activation is subject to Windows foreground-focus restrictions
-- Tray automation depends on UI Automation names, display language, and application behavior
-- Fixture tests do not exercise installed applications or live tray icons
+Generated launchers have no installer or persistent state. Remove an EXE by deleting it.
+
+## Troubleshooting
+
+- An ambiguous `-AppName` must be replaced with the exact `-AppId`
+- Exit `3` is usually a Windows foreground-focus restriction, not a build error
+- Tray names depend on application accessibility metadata and display language; inspect the live UI Automation names when exit `4` persists

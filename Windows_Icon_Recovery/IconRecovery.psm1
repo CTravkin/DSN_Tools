@@ -5,10 +5,15 @@ function Resolve-IconPortablePath {
     param([Parameter(Mandatory)][string]$Path)
 
     $expanded = [Environment]::ExpandEnvironmentVariables($Path)
-    if ([string]::IsNullOrWhiteSpace($expanded) -or -not [IO.Path]::IsPathRooted($expanded)) {
+    if ([string]::IsNullOrWhiteSpace($expanded) -or
+        -not [IO.Path]::IsPathRooted($expanded) -or
+        $expanded -match '^[A-Za-z]:[^\\/]') {
         throw "Path must be absolute after environment expansion: $Path"
     }
-    [IO.Path]::GetFullPath($expanded).TrimEnd('\')
+    $full = [IO.Path]::GetFullPath($expanded)
+    $root = [IO.Path]::GetPathRoot($full)
+    if ([string]::Equals($full, $root, [StringComparison]::OrdinalIgnoreCase)) { return $full }
+    $full.TrimEnd('\')
 }
 
 function Get-IconSourceFile {
@@ -50,7 +55,9 @@ function Read-IconTextFile {
             [void]$encoding.GetString($bytes)
         }
         catch {
-            $encoding = [Text.Encoding]::GetEncoding(1251)
+            $encoding = [Text.Encoding]::GetEncoding(
+                [Globalization.CultureInfo]::CurrentCulture.TextInfo.ANSICodePage
+            )
         }
     }
 
@@ -100,7 +107,12 @@ function Write-IconTextFile {
 function Get-IconResourceValue {
     param([AllowEmptyString()][string]$Text)
 
-    $match = [regex]::Match($Text, '(?im)^IconResource=(?<value>.+?)\s*$')
+    $section = [regex]::Match(
+        $Text,
+        '(?ims)^\[\.ShellClassInfo\][^\r\n]*(?:\r?\n|\z)(?<body>.*?)(?=^\[[^\r\n]+\][ \t]*(?:\r?$)|\z)'
+    )
+    if (-not $section.Success) { return $null }
+    $match = [regex]::Match($section.Groups['body'].Value, '(?im)^IconResource[ \t]*=(?<value>[^\r\n]*)')
     if ($match.Success) { return $match.Groups['value'].Value.Trim() }
     $null
 }
@@ -114,22 +126,55 @@ function Set-IconResourceValue {
     param([AllowEmptyString()][string]$Text, [Parameter(Mandatory)][string]$Icon)
 
     $newline = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
-    $match = [regex]::Match($Text, '(?im)^IconResource=.*?\s*$')
-    if ($match.Success) {
-        return $Text.Remove($match.Index, $match.Length).Insert($match.Index, "IconResource=$Icon")
-    }
-    $section = [regex]::Match($Text, '(?im)^\[\.ShellClassInfo\]\s*$')
+    $section = [regex]::Match(
+        $Text,
+        '(?ims)^\[\.ShellClassInfo\][^\r\n]*(?:\r?\n|\z)(?<body>.*?)(?=^\[[^\r\n]+\][ \t]*(?:\r?$)|\z)'
+    )
     if ($section.Success) {
-        return $Text.Insert($section.Index + $section.Length, $newline + "IconResource=$Icon")
+        $body = $section.Groups['body']
+        $existing = [regex]::Match($body.Value, '(?im)^IconResource[ \t]*=[^\r\n]*')
+        if ($existing.Success) {
+            $index = $body.Index + $existing.Index
+            return $Text.Remove($index, $existing.Length).Insert($index, "IconResource=$Icon")
+        }
+        return $Text.Insert($body.Index, "IconResource=$Icon$newline")
     }
     "[.ShellClassInfo]${newline}IconResource=$Icon${newline}${newline}$Text"
+}
+
+function ConvertTo-IconIdentity {
+    param([Parameter(Mandatory)][string]$Icon)
+
+    $expanded = [Environment]::ExpandEnvironmentVariables($Icon).Trim()
+    $match = [regex]::Match($expanded, '^(?<path>.*),(?<index>-?\d+)$')
+    $rawPath = if ($match.Success) { $match.Groups['path'].Value.Trim() } else { $expanded }
+    $index = if ($match.Success) { [int]$match.Groups['index'].Value } else { 0 }
+    $path = Resolve-IconPortablePath -Path $rawPath
+    "$($path.ToUpperInvariant()),$index"
+}
+
+function Test-IconResourceEqual {
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Actual,
+        [Parameter(Mandatory)][string]$Expected
+    )
+
+    if (Test-IconValueMissing -Icon $Actual) { return $false }
+    [string]::Equals(
+        (ConvertTo-IconIdentity -Icon $Actual),
+        (ConvertTo-IconIdentity -Icon $Expected),
+        [StringComparison]::OrdinalIgnoreCase
+    )
 }
 
 function Import-IconRecoveryManifest {
     param([Parameter(Mandatory)][string]$ManifestPath)
 
     $resolved = (Resolve-Path -LiteralPath $ManifestPath).Path
-    $document = Get-Content -Raw -LiteralPath $resolved | ConvertFrom-Json
+    $document = [IO.File]::ReadAllText(
+        $resolved,
+        [Text.UTF8Encoding]::new($false, $true)
+    ) | ConvertFrom-Json
     if ($null -eq $document.version -or [int]$document.version -ne 1) {
         throw 'Unsupported icon manifest version; expected version 1'
     }
@@ -152,6 +197,7 @@ function Import-IconRecoveryManifest {
             })
         }
     }
+    if ($entries.Count -eq 0) { throw 'Icon manifest must contain at least one folder or shortcut' }
     [pscustomobject]@{ Path = $resolved; Entries = @($entries) }
 }
 
@@ -209,7 +255,7 @@ function Get-IconAudit {
             if (-not $state.Exists) { $details.Add([pscustomobject]@{ type='FolderMissing'; path=$entry.Path; expected=$entry.Icon; actual=$null }); continue }
             if (-not $state.FileExists) { $details.Add([pscustomobject]@{ type='DesktopIniMissing'; path=$entry.Path; expected=$entry.Icon; actual=$null }); continue }
             if (Test-IconValueMissing -Icon $state.Icon) { $details.Add([pscustomobject]@{ type='IconMissing'; path=$entry.Path; expected=$entry.Icon; actual=$state.Icon }) }
-            elseif (-not [string]::Equals($state.Icon, $entry.Icon, [StringComparison]::OrdinalIgnoreCase)) { $details.Add([pscustomobject]@{ type='IconConflict'; path=$entry.Path; expected=$entry.Icon; actual=$state.Icon }) }
+            elseif (-not (Test-IconResourceEqual -Actual $state.Icon -Expected $entry.Icon)) { $details.Add([pscustomobject]@{ type='IconConflict'; path=$entry.Path; expected=$entry.Icon; actual=$state.Icon }) }
             if (-not ($state.FileAttributes -band [IO.FileAttributes]::Hidden) -or -not ($state.FileAttributes -band [IO.FileAttributes]::System) -or -not ($state.FolderAttributes -band [IO.FileAttributes]::ReadOnly)) {
                 $details.Add([pscustomobject]@{ type='AttributeMismatch'; path=$entry.Path; expected='desktop.ini Hidden+System; folder ReadOnly'; actual="$($state.FileAttributes); $($state.FolderAttributes)" })
             }
@@ -219,7 +265,7 @@ function Get-IconAudit {
             $state = Get-ShortcutIconState -Path $entry.Path
             if (-not $state.Exists) { $details.Add([pscustomobject]@{ type='ShortcutMissing'; path=$entry.Path; expected=$entry.Icon; actual=$null }); continue }
             if (Test-IconValueMissing -Icon $state.Icon) { $details.Add([pscustomobject]@{ type='IconMissing'; path=$entry.Path; expected=$entry.Icon; actual=$state.Icon }) }
-            elseif (-not [string]::Equals($state.Icon, $entry.Icon, [StringComparison]::OrdinalIgnoreCase)) { $details.Add([pscustomobject]@{ type='IconConflict'; path=$entry.Path; expected=$entry.Icon; actual=$state.Icon }) }
+            elseif (-not (Test-IconResourceEqual -Actual $state.Icon -Expected $entry.Icon)) { $details.Add([pscustomobject]@{ type='IconConflict'; path=$entry.Path; expected=$entry.Icon; actual=$state.Icon }) }
         }
         $source = Get-IconSourceFile -Icon $entry.Icon
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { $details.Add([pscustomobject]@{ type='IconSourceMissing'; path=$entry.Path; expected=$source; actual=$null }) }
@@ -251,4 +297,39 @@ namespace DSNTools {
     foreach ($item in $Path) { [DSNTools.IconRefresh]::SHChangeNotify(0x00002000, 0x0005, $item, [IntPtr]::Zero) }
 }
 
-Export-ModuleMember -Function Resolve-IconPortablePath,Get-IconSourceFile,Read-IconTextFile,Write-IconTextFile,Get-IconResourceValue,Test-IconValueMissing,Set-IconResourceValue,Import-IconRecoveryManifest,Get-FolderIconState,Get-ShortcutIconState,Get-IconAudit,Send-IconItemRefresh
+function Restore-IconRecoveryBackup {
+    param([Parameter(Mandatory)][string]$BackupPath)
+
+    $manifestPath = Join-Path (Resolve-Path -LiteralPath $BackupPath).Path 'manifest.json'
+    $document = [IO.File]::ReadAllText($manifestPath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json
+    if ($null -eq $document.version -or [int]$document.version -ne 1) {
+        throw 'Unsupported icon recovery backup version; expected version 1'
+    }
+    $changedPaths = [Collections.Generic.List[string]]::new()
+    foreach ($entry in @($document.entries)) {
+        $sourceFile = [string]$entry.sourceFile
+        if ([bool]$entry.existed) {
+            $backupFile = Join-Path (Join-Path $BackupPath 'files') ([string]$entry.backupFile)
+            $actualHash = (Get-FileHash -LiteralPath $backupFile -Algorithm SHA256).Hash
+            if (-not [string]::Equals($actualHash, [string]$entry.sha256, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "Backup hash mismatch: $backupFile"
+            }
+            if (Test-Path -LiteralPath $sourceFile -PathType Leaf) {
+                (Get-Item -LiteralPath $sourceFile -Force).Attributes = [IO.FileAttributes]::Normal
+            }
+            Copy-Item -LiteralPath $backupFile -Destination $sourceFile -Force
+            (Get-Item -LiteralPath $sourceFile -Force).Attributes = [IO.FileAttributes][int]$entry.sourceFileAttributes
+        }
+        elseif (Test-Path -LiteralPath $sourceFile -PathType Leaf) {
+            Remove-Item -LiteralPath $sourceFile -Force
+        }
+        if ($null -ne $entry.targetAttributes -and (Test-Path -LiteralPath ([string]$entry.target))) {
+            (Get-Item -LiteralPath ([string]$entry.target) -Force).Attributes = [IO.FileAttributes][int]$entry.targetAttributes
+        }
+        $changedPaths.Add([string]$entry.target)
+    }
+    if ($changedPaths.Count -gt 0) { Send-IconItemRefresh -Path @($changedPaths) }
+    [pscustomobject]@{ backup=(Resolve-Path -LiteralPath $BackupPath).Path; restored=@($document.entries).Count }
+}
+
+Export-ModuleMember -Function Resolve-IconPortablePath,Get-IconSourceFile,Read-IconTextFile,Write-IconTextFile,Get-IconResourceValue,Test-IconValueMissing,Set-IconResourceValue,ConvertTo-IconIdentity,Test-IconResourceEqual,Import-IconRecoveryManifest,Get-FolderIconState,Get-ShortcutIconState,Get-IconAudit,Send-IconItemRefresh,Restore-IconRecoveryBackup
