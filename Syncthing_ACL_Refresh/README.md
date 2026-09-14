@@ -27,7 +27,7 @@ Copy [`syncthing-acl-refresh.env.example`](syncthing-acl-refresh.env.example) an
 | `TLS_CERTIFICATE` | no | `/etc/syncthing-acl-refresh/https-cert.pem` | Pinned GUI certificate |
 | `FOLDER_ALLOWLIST` | no | `/etc/syncthing-acl-refresh/folders.conf` | Root-controlled folder allowlist |
 
-The allowlist format is `folder-id=/absolute/path`, one entry per folder that this utility should manage. The file must be owned by root and not writable by group or others. Each listed ID and path must match Syncthing configuration; unlisted Syncthing folders are ignored.
+The allowlist format is `folder-id=/absolute/path`, one entry per folder that this utility should manage. The file must be owned by root and not writable by group or others. Each listed ID and path must match Syncthing configuration; unlisted Syncthing folders are ignored. Managed folder paths must not overlap.
 
 CLI options override environment-file values. `--env-file` is intended for direct invocations; systemd loads the installed environment file itself.
 
@@ -80,7 +80,7 @@ Exit code `1` means some recorded path could not be safely identified or cleaned
 sudo ACL_TEST_USERS=root,nobody python3 -m unittest discover -s tests -v
 ```
 
-ACL integration tests require root, two existing users, `getfacl`, `setfacl`, `runuser`, and `openssl`.
+ACL integration tests require root, two existing users, one additional local account, `getfacl`, `setfacl`, `runuser`, and `openssl`. The additional account is selected automatically and is never granted access.
 
 ## Limitations
 

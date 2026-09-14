@@ -71,11 +71,22 @@ def available_acl_test_users() -> tuple[str, ...]:
 
 
 ACL_TEST_USERS = available_acl_test_users()
+
+
+def available_unmanaged_acl_test_user() -> str | None:
+    if os.name != "posix":
+        return None
+    excluded = {*ACL_TEST_USERS, pwd.getpwuid(os.geteuid()).pw_name}
+    return next((entry.pw_name for entry in pwd.getpwall() if entry.pw_name not in excluded), None)
+
+
+ACL_TEST_UNMANAGED_USER = available_unmanaged_acl_test_user()
 ACL_TESTS_AVAILABLE = (
     os.name == "posix"
     and hasattr(os, "geteuid")
     and os.geteuid() == 0
     and len(ACL_TEST_USERS) == 2
+    and ACL_TEST_UNMANAGED_USER is not None
     and all(shutil.which(command) for command in ("getfacl", "setfacl", "runuser"))
 )
 
@@ -155,6 +166,18 @@ class FolderAllowlistTests(unittest.TestCase):
             self.assertEqual(
                 [managed], module.require_allowed_folders([managed, unrelated], allowlist)
             )
+
+    def test_overlapping_managed_folders_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            outer = Path(temporary) / "outer"
+            folders = [
+                module.FolderConfiguration("outer", outer),
+                module.FolderConfiguration("nested", outer / "nested"),
+            ]
+            allowlist = {folder.folder_id: folder.path for folder in folders}
+
+            with self.assertRaisesRegex(ValueError, "overlap"):
+                module.require_allowed_folders(folders, allowlist)
 
     @unittest.skipUnless(os.name == "posix", "root-path check uses POSIX semantics")
     def test_only_the_filesystem_root_is_rejected(self) -> None:
@@ -279,19 +302,6 @@ class IgnoreMatcherTests(unittest.TestCase):
         matcher = module.IgnoreMatcher([], control_parents={"rules"})
 
         self.assertEqual(module.AccessLevel.FULL, matcher.directory_access("rules"))
-
-    def test_control_file_denial_wins_across_nested_policies(self) -> None:
-        root = Path("/srv/sync")
-        path = root / ".stignore"
-        policies = [
-            module.FolderPolicy("outer", root, module.IgnoreMatcher([])),
-            module.FolderPolicy("nested", root / ".stignore", module.IgnoreMatcher([])),
-        ]
-
-        self.assertEqual(
-            module.AccessLevel.NONE,
-            module.desired_for_policies(path, False, policies),
-        )
 
     def test_nested_rooted_negation_requires_global_traversal(self) -> None:
         matcher = module.IgnoreMatcher(
@@ -643,7 +653,10 @@ class AclReconciliationTests(unittest.TestCase):
             path = Path(temporary) / "conflict.txt"
             path.write_text("data", encoding="utf-8")
             subprocess.run(
-                ("setfacl", "-n", "-m", "u:www-data:rwx,m::r--", "--", os.fspath(path)),
+                (
+                    "setfacl", "-n", "-m",
+                    f"u:{ACL_TEST_UNMANAGED_USER}:rwx,m::r--", "--", os.fspath(path),
+                ),
                 check=True,
             )
 
@@ -656,7 +669,7 @@ class AclReconciliationTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            self.assertIn("user:www-data:rwx", result.stdout)
+            self.assertIn(f"user:{ACL_TEST_UNMANAGED_USER}:rwx", result.stdout)
             self.assertIn("mask::r--", result.stdout)
             for user in ACL_TEST_USERS:
                 self.assertNotIn(f"user:{user}:", result.stdout)

@@ -90,12 +90,25 @@ internal static class TrayLauncher
         return null;
     }
 
-    private static AutomationElement FindMenuItem()
+    private static AutomationElement FindMenuItem(System.Windows.Point origin)
     {
-        Condition condition = new AndCondition(
+        Condition menus = new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Menu);
+        Condition itemCondition = new AndCondition(
             new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.MenuItem),
             new PropertyCondition(AutomationElement.NameProperty, TrayMenuItemName));
-        return AutomationElement.RootElement.FindFirst(TreeScope.Descendants, condition);
+        AutomationElement nearest = null;
+        double nearestDistance = Double.MaxValue;
+        foreach (AutomationElement menu in AutomationElement.RootElement.FindAll(TreeScope.Descendants, menus))
+        {
+            AutomationElement item = menu.FindFirst(TreeScope.Descendants, itemCondition);
+            if (item == null || !item.Current.IsEnabled || item.Current.IsOffscreen) continue;
+            System.Windows.Rect rectangle = menu.Current.BoundingRectangle;
+            double dx = origin.X < rectangle.Left ? rectangle.Left-origin.X : (origin.X > rectangle.Right ? origin.X-rectangle.Right : 0);
+            double dy = origin.Y < rectangle.Top ? rectangle.Top-origin.Y : (origin.Y > rectangle.Bottom ? origin.Y-rectangle.Bottom : 0);
+            double distance = dx*dx + dy*dy;
+            if (distance < nearestDistance) { nearest=item; nearestDistance=distance; }
+        }
+        return nearest;
     }
 
     private static bool RightClick(int x, int y)
@@ -126,7 +139,7 @@ internal static class TrayLauncher
                     if (icon.TryGetClickablePoint(out point) && RightClick((int)point.X, (int)point.Y))
                     {
                         Thread.Sleep(RetryDelayMilliseconds);
-                        AutomationElement item = FindMenuItem();
+                        AutomationElement item = FindMenuItem(point);
                         if (item != null && item.Current.IsEnabled)
                         {
                             object pattern;

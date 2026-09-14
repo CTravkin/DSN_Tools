@@ -259,7 +259,14 @@ def require_allowed_folders(
                 f"Allowlisted folder does not match Syncthing configuration: {folder_id}={expected}"
             )
         selected.append(folder)
-    return sorted(selected, key=lambda item: (len(item.path.parts), os.fspath(item.path)))
+    selected.sort(key=lambda item: (len(item.path.parts), os.fspath(item.path)))
+    for index, folder in enumerate(selected):
+        if any(
+            folder.path == parent.path or folder.path.is_relative_to(parent.path)
+            for parent in selected[:index]
+        ):
+            raise ValueError("Managed Syncthing folder paths must not overlap")
+    return selected
 
 
 def normalize_gui_https(address: str, use_tls: bool) -> str:
@@ -1231,25 +1238,8 @@ def reconcile_root(root: Path, matcher: IgnoreMatcher, state: StateStore, force:
     return stats
 
 
-def compact_roots(roots: Iterable[Path]) -> list[Path]:
-    compacted: list[Path] = []
-    for root in sorted(set(roots), key=lambda item: (len(item.parts), os.fspath(item))):
-        if not any(root == parent or root.is_relative_to(parent) for parent in compacted):
-            compacted.append(root)
-    return compacted
-
-
 def policies_for_path(path: Path, policies: Iterable[FolderPolicy]) -> list[FolderPolicy]:
     return [policy for policy in policies if path == policy.root or path.is_relative_to(policy.root)]
-
-
-def desired_for_policies(path: Path, directory: bool, policies: list[FolderPolicy]) -> AccessLevel:
-    applicable = policies_for_path(path, policies)
-    for policy in applicable:
-        if path != policy.root and policy.matcher.is_control_path(path.relative_to(policy.root).as_posix()):
-            return AccessLevel.NONE
-    levels = [desired_for_matcher(path, policy.root, policy.matcher, directory) for policy in applicable]
-    return max(levels, key=lambda item: item.value, default=AccessLevel.NONE)
 
 
 def reconcile_removed_state(
@@ -1293,21 +1283,14 @@ def reconcile_removed_state(
 def reconcile_all(policies: list[FolderPolicy], state: StateStore, force: bool = False) -> ReconcileStats:
     started = time.monotonic()
     stats = ReconcileStats()
-    roots = compact_roots(policy.root for policy in policies)
-    for root in roots:
+    for policy in policies:
+        root = policy.root
         if not root.is_dir():
             log(f"Configured folder is not available yet: {root}")
             stats.failed += 1
             continue
         try:
-            with ManagedRoot(root) as managed_root:
-                stats.absorb(
-                    reconcile_tree(
-                        root,
-                        lambda path, directory: desired_for_policies(path, directory, policies),
-                        state, managed_root, force,
-                    )
-                )
+            stats.absorb(reconcile_root(root, policy.matcher, state, force))
         except (OSError, UnsafePathError) as error:
             log(f"Cannot safely scan managed root {root}: {error}")
             stats.failed += 1
@@ -1315,7 +1298,7 @@ def reconcile_all(policies: list[FolderPolicy], state: StateStore, force: bool =
     state.commit()
     stats.elapsed = time.monotonic() - started
     log(
-        f"Full reconciliation complete: folders={len(policies)} roots={len(roots)} "
+        f"Full reconciliation complete: folders={len(policies)} "
         f"visited={stats.visited} acl_reads={stats.acl_reads} changed={stats.changed} "
         f"failed={stats.failed} elapsed={stats.elapsed:.3f}s"
     )

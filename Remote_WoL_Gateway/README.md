@@ -4,7 +4,7 @@
 
 `remote-wol-gateway` exposes a small bearer-authenticated HTTP API for checking and waking one configured machine. It sends Wake-on-LAN locally over UDP or through a constrained SSH sender and confirms reachability through ICMP and/or TCP probes.
 
-The listener is IPv4-only, processes a bounded queue serially, and allows only one wake operation at a time. Keep it bound to loopback or place it behind a trusted tunnel or TLS endpoint; the service itself serves plain HTTP.
+The listener is IPv4-only and handles HTTP requests concurrently, while allowing only one wake operation at a time. Keep it bound to loopback or place it behind a trusted tunnel or TLS endpoint; the service itself serves plain HTTP.
 
 ## Requirements
 
