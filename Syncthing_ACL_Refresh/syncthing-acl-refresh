@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
 import hashlib
 import hmac
 import http.client
@@ -726,7 +727,14 @@ class ManagedRoot:
                 flags = os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
                 if index < len(relative.parts) - 1:
                     flags |= os.O_DIRECTORY
-                next_fd = os.open(component, flags, dir_fd=fd)
+                try:
+                    next_fd = os.open(component, flags, dir_fd=fd)
+                except OSError as error:
+                    if flags & os.O_DIRECTORY and error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        raise UnsafePathError(
+                            f"Path component is not a real directory: {path}"
+                        ) from error
+                    raise
                 os.close(fd)
                 fd = next_fd
             metadata = os.fstat(fd)
