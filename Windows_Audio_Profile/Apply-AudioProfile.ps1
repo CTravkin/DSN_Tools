@@ -7,7 +7,8 @@ param(
     [switch]$WhatIf,
     [switch]$Json,
     [switch]$InternalElevated,
-    [string]$ResultPath
+    [string]$ResultPath,
+    [string]$ExpectedProfileSha256
 )
 
 Set-StrictMode -Version Latest
@@ -46,7 +47,7 @@ function Write-ApplyResult {
 function Invoke-ElevatedApply {
     $temporaryResult = Join-Path ([IO.Path]::GetTempPath()) ('WindowsAudioProfile-' + [guid]::NewGuid().ToString('N') + '.json')
     $quote = { param([string]$Value) "'" + $Value.Replace("'", "''") + "'" }
-    $command = "& $(& $quote $PSCommandPath) -ProfilePath $(& $quote ([IO.Path]::GetFullPath($ProfilePath))) -ApplyMode $ApplyMode -BackupRoot $(& $quote ([IO.Path]::GetFullPath($BackupRoot))) -InternalElevated -ResultPath $(& $quote $temporaryResult)"
+    $command = "& $(& $quote $PSCommandPath) -ProfilePath $(& $quote ([IO.Path]::GetFullPath($ProfilePath))) -ApplyMode $ApplyMode -BackupRoot $(& $quote ([IO.Path]::GetFullPath($BackupRoot))) -InternalElevated -ResultPath $(& $quote $temporaryResult) -ExpectedProfileSha256 $(& $quote $profileSha256)"
     if ($IgnoreMachineBinding) { $command += ' -IgnoreMachineBinding' }
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -73,7 +74,10 @@ $rolledBack = $false
 try {
     if ([string]::IsNullOrWhiteSpace($BackupRoot)) { $BackupRoot = Join-Path $PSScriptRoot 'Backups' }
     Import-Module (Join-Path $PSScriptRoot 'WindowsAudioProfile.psm1') -Force
-    $profile = Import-AudioProfile -Path $ProfilePath
+    $resolvedProfilePath = (Resolve-Path -LiteralPath $ProfilePath).Path
+    if ($InternalElevated -and [string]::IsNullOrWhiteSpace($ExpectedProfileSha256)) { throw 'Internal elevated Apply requires an expected profile hash.' }
+    $profileSha256 = if ([string]::IsNullOrWhiteSpace($ExpectedProfileSha256)) { (Get-FileHash -LiteralPath $resolvedProfilePath -Algorithm SHA256).Hash } else { $ExpectedProfileSha256 }
+    $profile = Import-AudioProfile -Path $resolvedProfilePath -ExpectedSha256 $profileSha256
     $inventory = @(Get-WindowsAudioInventory)
     $validation = Test-AudioProfileState -Profile $profile -Inventory $inventory -IgnoreMachineBinding:$IgnoreMachineBinding
     if (-not $validation.valid) { throw (@($validation.errors | ForEach-Object { $_.message }) -join '; ') }
@@ -209,7 +213,9 @@ catch {
     $failure = $_.Exception.Message
     if ($ApplyMode -eq 'Strict' -and $null -ne $backupPath -and (Test-Path -LiteralPath (Join-Path $backupPath 'state.json'))) {
         try {
-            & (Join-Path $PSScriptRoot 'Undo-AudioProfile.ps1') -BackupPath $backupPath -InternalElevated -Json | Out-Null
+            $rollbackBackupFile = Join-Path $backupPath 'state.json'
+            $rollbackBackupSha256 = (Get-FileHash -LiteralPath $rollbackBackupFile -Algorithm SHA256).Hash
+            & (Join-Path $PSScriptRoot 'Undo-AudioProfile.ps1') -BackupPath $backupPath -InternalElevated -ExpectedBackupSha256 $rollbackBackupSha256 -Json | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Undo exited with code $LASTEXITCODE." }
             $rolledBack = $true
         }

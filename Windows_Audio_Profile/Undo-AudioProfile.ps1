@@ -4,7 +4,8 @@ param(
     [switch]$WhatIf,
     [switch]$Json,
     [switch]$InternalElevated,
-    [string]$ResultPath
+    [string]$ResultPath,
+    [string]$ExpectedBackupSha256
 )
 
 Set-StrictMode -Version Latest
@@ -18,7 +19,7 @@ function Test-Administrator {
 function Invoke-ElevatedUndo {
     $temporaryResult = Join-Path ([IO.Path]::GetTempPath()) ('WindowsAudioProfile-Undo-' + [guid]::NewGuid().ToString('N') + '.json')
     $quote = { param([string]$Value) "'" + $Value.Replace("'", "''") + "'" }
-    $command = "& $(& $quote $PSCommandPath) -BackupPath $(& $quote ([IO.Path]::GetFullPath($BackupPath))) -InternalElevated -ResultPath $(& $quote $temporaryResult)"
+    $command = "& $(& $quote $PSCommandPath) -BackupPath $(& $quote ([IO.Path]::GetFullPath($BackupPath))) -InternalElevated -ResultPath $(& $quote $temporaryResult) -ExpectedBackupSha256 $(& $quote $backupSha256)"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     try {
@@ -41,8 +42,9 @@ try {
     Import-Module (Join-Path $PSScriptRoot 'WindowsAudioProfile.psm1') -Force
     $resolvedBackup = (Resolve-Path -LiteralPath $BackupPath).Path
     $backupFile = if (Test-Path -LiteralPath $resolvedBackup -PathType Container) { Join-Path $resolvedBackup 'state.json' } else { $resolvedBackup }
-    $backup = [IO.File]::ReadAllText($backupFile, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
-    if ([int]$backup.version -ne 1) { throw 'Unsupported audio backup version; expected 1.' }
+    if ($InternalElevated -and [string]::IsNullOrWhiteSpace($ExpectedBackupSha256)) { throw 'Internal elevated Undo requires an expected backup hash.' }
+    $backupSha256 = if ([string]::IsNullOrWhiteSpace($ExpectedBackupSha256)) { (Get-FileHash -LiteralPath $backupFile -Algorithm SHA256).Hash } else { $ExpectedBackupSha256 }
+    $backup = Import-AudioBackup -Path $backupFile -ExpectedSha256 $backupSha256
     if (-not [string]::Equals([string]$backup.machineIdSha256, (Get-AudioMachineHash), [StringComparison]::OrdinalIgnoreCase)) { throw 'Audio backup belongs to another Windows installation.' }
     if ($WhatIf) {
         [pscustomobject]@{ restored=$false; whatIf=$true; backup=$resolvedBackup; devices=@($backup.devices).Count } | ConvertTo-Json -Compress

@@ -61,7 +61,7 @@ The profile uses patch semantics. A missing device setting is left unchanged. `n
 
 `enabled` changes the endpoint state used by the classic Sound panel. It never disables the underlying PnP device or Bluetooth adapter.
 
-Priority arrays are ordered from least to most preferred. `allRoles` covers Console, Multimedia, and Communications. Entries under `roles` replace the order for one role. If priority is present for a flow, it must list every eligible endpoint in that flow. Endpoints marked by Windows as `NeverSetAsDefaultEndpoint` are excluded.
+Priority arrays are ordered from least to most preferred. `allRoles` covers Console, Multimedia, and Communications. Entries under `roles` replace the order for one role. If priority is present for a flow, it must list every eligible endpoint in that flow. Endpoints marked by Windows as `NeverSetAsDefaultEndpoint` are excluded. Verification checks both stored priority levels and the effective default endpoint for every configured role.
 
 See [audio-profile.example.json](audio-profile.example.json) and [audio-profile.schema.json](audio-profile.schema.json).
 
@@ -75,7 +75,7 @@ Exported profiles are bound to the current Windows installation by a SHA-256 has
 
 ## Elevation and backups
 
-`Apply` and `Undo` request UAC only when a change is required. Normal endpoint properties use Core Audio. Exact default priority levels require a short-lived scheduled task under SYSTEM and a process token from the Windows Modules Installer (`TrustedInstaller`) service. Priority code and data are copied to a temporary ACL-protected directory under ProgramData and verified by SHA-256 before privileged execution. The helper has a finite timeout. The task, staging directory, and any temporary service start are cleaned up after the operation; no service or background helper is installed.
+`Apply` and `Undo` request UAC only when a change is required. The profile or backup is bound to its pre-UAC snapshot by SHA-256. Normal endpoint properties use Core Audio. Exact default priority levels require a short-lived scheduled task under SYSTEM and a process token from the Windows Modules Installer (`TrustedInstaller`) service. Priority code and data are copied to a temporary ACL-protected directory under ProgramData and verified by SHA-256 before privileged execution. The helper has a finite timeout. The task, staging directory, and any temporary service start are cleaned up after the operation; no service or background helper is installed.
 
 Before changing anything, `Apply` verifies that every touched property can be backed up, then writes `state.json` under `Backups/<timestamp>-<id>` by default. Use `-BackupRoot` to select another location. `Undo` restores and verifies only the exact fields and priority flows touched by the source profile. A restore mismatch is reported as a failure.
 
@@ -86,6 +86,7 @@ Before changing anything, `Apply` verifies that every touched property can be ba
 - Fixed-volume virtual endpoints can report a `0 dB..0 dB` range. Their percentage control is not meaningful.
 - Per-channel levels, Microphone Boost, driver-specific effects, PnP state, driver installation, and Bluetooth pairing are outside version 1.
 - Sound control panels can cache names and icons until reopened.
+- Version 1 is a portable script utility, not a signed installer. Protected staging prevents modification after elevation begins, but the utility does not authenticate source scripts before launch. Keep the checkout in a trusted location and review updates before approving UAC.
 
 ## Tests
 

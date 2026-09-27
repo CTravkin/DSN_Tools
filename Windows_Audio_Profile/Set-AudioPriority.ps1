@@ -56,26 +56,32 @@ function Get-PriorityBundleHash {
 
 function New-ProtectedPriorityStagingDirectory {
     $path = Join-Path $env:ProgramData ('DSNTools-WindowsAudioProfile-' + [guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $path -ErrorAction Stop | Out-Null
-    $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
-    $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
-    $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-    $propagation = [Security.AccessControl.PropagationFlags]::None
-    $allow = [Security.AccessControl.AccessControlType]::Allow
-    $acl = [Security.AccessControl.DirectorySecurity]::new()
-    $acl.SetAccessRuleProtection($true, $false)
-    $acl.SetOwner($administrators)
-    [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($administrators, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, $propagation, $allow))
-    [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, $propagation, $allow))
-    Set-Acl -LiteralPath $path -AclObject $acl
-    $verifiedAcl = Get-Acl -LiteralPath $path
-    if (-not $verifiedAcl.AreAccessRulesProtected) { throw 'Priority staging directory still inherits access rules.' }
-    $allowedSids = @($administrators.Value, $system.Value)
-    foreach ($rule in $verifiedAcl.Access) {
-        $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
-        if ($rule.AccessControlType -eq $allow -and $allowedSids -notcontains $sid) { throw "Priority staging grants access to unexpected identity '$sid'." }
+    try {
+        New-Item -ItemType Directory -Path $path -ErrorAction Stop | Out-Null
+        $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+        $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+        $inheritance = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        $propagation = [Security.AccessControl.PropagationFlags]::None
+        $allow = [Security.AccessControl.AccessControlType]::Allow
+        $acl = [Security.AccessControl.DirectorySecurity]::new()
+        $acl.SetAccessRuleProtection($true, $false)
+        $acl.SetOwner($administrators)
+        [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($administrators, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, $propagation, $allow))
+        [void]$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, $propagation, $allow))
+        Set-Acl -LiteralPath $path -AclObject $acl
+        $verifiedAcl = Get-Acl -LiteralPath $path
+        if (-not $verifiedAcl.AreAccessRulesProtected) { throw 'Priority staging directory still inherits access rules.' }
+        $allowedSids = @($administrators.Value, $system.Value)
+        foreach ($rule in $verifiedAcl.Access) {
+            $sid = $rule.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+            if ($rule.AccessControlType -eq $allow -and $allowedSids -notcontains $sid) { throw "Priority staging grants access to unexpected identity '$sid'." }
+        }
+        $path
     }
-    $path
+    catch {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
+        throw
+    }
 }
 
 try {
@@ -126,7 +132,13 @@ try {
             if (-not (Test-Path -LiteralPath $resultPath -PathType Leaf)) { throw 'TrustedInstaller worker did not create its result file.' }
         }
         finally {
-            if ($startedService) { Stop-Service -Name 'TrustedInstaller' -Force -ErrorAction SilentlyContinue }
+            if ($startedService) {
+                $service = Get-Service -Name 'TrustedInstaller'
+                if ($service.Status -ne 'Stopped') { Stop-Service -Name 'TrustedInstaller' -Force -ErrorAction Stop }
+                $service = Get-Service -Name 'TrustedInstaller'
+                $service.WaitForStatus([ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(10))
+                if ($service.Status -ne 'Stopped') { throw 'TrustedInstaller did not return to its previous stopped state.' }
+            }
         }
         exit 0
     }

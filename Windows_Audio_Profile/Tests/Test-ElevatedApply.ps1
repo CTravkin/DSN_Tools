@@ -44,6 +44,28 @@ function Get-ProfileDifferenceCount {
     @(Get-AudioProfileDifferences -Profile $profile -ResolvedDevices $resolved -Inventory $inventory).Count
 }
 
+function Assert-EffectiveProfileDefaults {
+    param([Parameter(Mandatory)][string]$Path)
+    Import-Module (Join-Path $utilityRoot 'WindowsAudioProfile.psm1') -Force
+    $profile = Import-AudioProfile -Path $Path
+    $inventory = @(Get-WindowsAudioInventory)
+    $resolved = Resolve-AudioProfileDevices -Profile $profile -Inventory $inventory
+    $assignments = @(Get-AudioPriorityAssignments -Profile $profile -ResolvedDevices $resolved -Inventory $inventory)
+    foreach ($flow in @('render','capture')) {
+        foreach ($role in @('console','multimedia','communications')) {
+            $preferredCandidates = @($assignments | Where-Object { $_.Flow -eq $flow -and $_.Role -eq $role } | Sort-Object Level -Descending | ForEach-Object {
+                $assignment = $_
+                $matches = @($inventory | Where-Object { $_.Flow -eq $flow -and $_.EndpointId -eq $assignment.EndpointId -and $_.Active })
+                if ($matches.Count -gt 0) { $matches[0] }
+            } | Where-Object { $null -ne $_ })
+            $preferred = if ($preferredCandidates.Count -gt 0) { $preferredCandidates[0] } else { $null }
+            if ($null -eq $preferred) { continue }
+            $actual = Get-WindowsAudioDefaultEndpoint -Flow $flow -Role $role
+            Assert-True ([string]::Equals([string]$preferred.FullEndpointId, [string]$actual, [StringComparison]::OrdinalIgnoreCase)) "Effective default mismatch for $flow/$role."
+        }
+    }
+}
+
 try {
     $principal = [Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent())
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -122,12 +144,14 @@ try {
     $applied = $true
 
     Assert-True ((Get-ProfileDifferenceCount -Path $changedProfilePath) -eq 0) 'Changed priority did not match live read-back.'
+    Assert-EffectiveProfileDefaults -Path $changedProfilePath
 
     $undo = Invoke-JsonScript -Script (Join-Path $utilityRoot 'Undo-AudioProfile.ps1') -Arguments @('-BackupPath', $backupPath, '-Json')
     Assert-True ($undo.ExitCode -eq 0) 'Undo failed.'
     $applied = $false
 
     Assert-True ((Get-ProfileDifferenceCount -Path $originalProfilePath) -eq 0) 'Original priority did not return after Undo.'
+    Assert-EffectiveProfileDefaults -Path $originalProfilePath
 
     $copyRoot = Join-Path $testRoot 'UtilityCopy'
     Copy-Item -LiteralPath $utilityRoot -Destination $copyRoot -Recurse
@@ -158,5 +182,6 @@ catch {
         if ($recovery.ExitCode -ne 0) { Write-Error "The test changed priority and emergency Undo failed. Preserve and use backup: $backupPath" }
         else { $applied = $false }
     }
+    if (-not $applied -and (Test-Path -LiteralPath $testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
     throw
 }
