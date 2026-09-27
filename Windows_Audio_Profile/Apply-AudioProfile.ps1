@@ -1,9 +1,10 @@
-[CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='High')]
+[CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$ProfilePath,
     [ValidateSet('Strict', 'BestEffort')][string]$ApplyMode = 'Strict',
     [string]$BackupRoot,
     [switch]$IgnoreMachineBinding,
+    [switch]$WhatIf,
     [switch]$Json,
     [switch]$InternalElevated,
     [string]$ResultPath
@@ -45,7 +46,7 @@ function Write-ApplyResult {
 function Invoke-ElevatedApply {
     $temporaryResult = Join-Path ([IO.Path]::GetTempPath()) ('WindowsAudioProfile-' + [guid]::NewGuid().ToString('N') + '.json')
     $quote = { param([string]$Value) "'" + $Value.Replace("'", "''") + "'" }
-    $command = "& $(& $quote $PSCommandPath) -ProfilePath $(& $quote ([IO.Path]::GetFullPath($ProfilePath))) -ApplyMode $ApplyMode -BackupRoot $(& $quote ([IO.Path]::GetFullPath($BackupRoot))) -InternalElevated -ResultPath $(& $quote $temporaryResult) -Confirm:`$false"
+    $command = "& $(& $quote $PSCommandPath) -ProfilePath $(& $quote ([IO.Path]::GetFullPath($ProfilePath))) -ApplyMode $ApplyMode -BackupRoot $(& $quote ([IO.Path]::GetFullPath($BackupRoot))) -InternalElevated -ResultPath $(& $quote $temporaryResult)"
     if ($IgnoreMachineBinding) { $command += ' -IgnoreMachineBinding' }
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $powerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -55,7 +56,11 @@ function Invoke-ElevatedApply {
         $result = Get-Content -Raw -LiteralPath $temporaryResult | ConvertFrom-Json
         if ($Json) { $result | ConvertTo-Json -Depth 10 -Compress }
         elseif ($result.verified) { Write-Output "Audio profile applied and verified. Backup: $($result.backup)" }
-        else { Write-Output "Audio profile failed: $($result.error)" }
+        else {
+            $messages = if ($result.PSObject.Properties['errors']) { @($result.errors | ForEach-Object { $_.error }) } else { @() }
+            if ($messages.Count -eq 0 -and $result.PSObject.Properties['error']) { $messages = @([string]$result.error) }
+            Write-Output "Audio profile completed with errors: $($messages -join '; ')"
+        }
         exit $process.ExitCode
     }
     finally { Remove-Item -LiteralPath $temporaryResult -Force -ErrorAction SilentlyContinue }
@@ -77,7 +82,7 @@ try {
     $matchedCount = @($resolved.Values | Where-Object { $null -ne $_ }).Count
     $initialDifferences = @(Get-AudioProfileDifferences -Profile $profile -ResolvedDevices $resolved -Inventory $inventory)
 
-    if ($WhatIfPreference) {
+    if ($WhatIf) {
         [pscustomobject][ordered]@{
             applied = $false; whatIf = $true; mode = $ApplyMode; devices = $matchedCount
             differences = $initialDifferences.Count; priorityAssignments = $priorities.Count
@@ -103,6 +108,7 @@ try {
     $backupFile = Join-Path $backupPath 'state.json'
     $backup = New-AudioBackupDocument -Profile $profile -ResolvedDevices $resolved -Inventory $inventory
     [IO.File]::WriteAllText($backupFile, ($backup | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+    $verifiedVolumeKeys = [Collections.Generic.List[string]]::new()
 
     foreach ($profileDevice in @($profile.devices)) {
         $key = [string]$profileDevice.key
@@ -148,6 +154,7 @@ try {
                 if ((Test-Property -Object $volume -Name 'percent') -and [Math]::Abs([double]$volume.percent - [double]$actualVolume.percent) -gt 0.11) { throw "Volume verification failed for '$key'." }
                 if ((Test-Property -Object $volume -Name 'decibels') -and [Math]::Abs([double]$volume.decibels - [double]$actualVolume.decibels) -gt 0.11) { throw "Volume verification failed for '$key'." }
                 if ((Test-Property -Object $volume -Name 'muted') -and [bool]$volume.muted -ne [bool]$actualVolume.muted) { throw "Mute verification failed for '$key'." }
+                $verifiedVolumeKeys.Add($key)
             }
             if ((Test-Property -Object $settings -Name 'enabled') -or $temporarilyEnabled) {
                 $desiredEnabled = if (Test-Property -Object $settings -Name 'enabled') { [bool]$settings.enabled } else { [bool]$backupDevice.enabled }
@@ -162,28 +169,34 @@ try {
     }
 
     if ($priorities.Count -gt 0) {
-        $currentInventory = @(Get-WindowsAudioInventory)
-        foreach ($flow in @('render', 'capture')) {
-            foreach ($role in @('console', 'multimedia', 'communications')) {
-                $ordered = @($priorities | Where-Object { $_.Flow -eq $flow -and $_.Role -eq $role } | Sort-Object Level -Descending)
-                foreach ($assignment in $ordered) {
-                    $candidate = @($currentInventory | Where-Object { $_.Flow -eq $flow -and $_.EndpointId -eq $assignment.EndpointId })[0]
-                    if ($candidate.Active) { Set-WindowsAudioDefaultEndpoint -EndpointId $candidate.FullEndpointId -Role $role; break }
+        try {
+            $currentInventory = @(Get-WindowsAudioInventory)
+            foreach ($flow in @('render', 'capture')) {
+                foreach ($role in @('console', 'multimedia', 'communications')) {
+                    $ordered = @($priorities | Where-Object { $_.Flow -eq $flow -and $_.Role -eq $role } | Sort-Object Level -Descending)
+                    foreach ($assignment in $ordered) {
+                        $candidate = @($currentInventory | Where-Object { $_.Flow -eq $flow -and $_.EndpointId -eq $assignment.EndpointId })[0]
+                        if ($candidate.Active) { Set-WindowsAudioDefaultEndpoint -EndpointId $candidate.FullEndpointId -Role $role; break }
+                    }
                 }
             }
+            $priorityPlan = [ordered]@{
+                version=1; machineIdSha256=(Get-AudioMachineHash)
+                assignments=@($priorities | ForEach-Object { [ordered]@{ flow=$_.Flow; endpointId=$_.EndpointId; roleIndex=$_.RoleIndex; hasValue=$true; level=$_.Level } })
+            }
+            $priorityPlanPath = Join-Path $backupPath 'priority-plan.json'
+            [IO.File]::WriteAllText($priorityPlanPath, ($priorityPlan | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+            & (Join-Path $PSScriptRoot 'Set-AudioPriority.ps1') -Mode Controller -PlanPath $priorityPlanPath -Json | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "Priority worker exited with code $LASTEXITCODE." }
         }
-        $priorityPlan = [ordered]@{
-            version=1; machineIdSha256=(Get-AudioMachineHash)
-            assignments=@($priorities | ForEach-Object { [ordered]@{ flow=$_.Flow; endpointId=$_.EndpointId; roleIndex=$_.RoleIndex; hasValue=$true; level=$_.Level } })
+        catch {
+            $errors.Add([pscustomobject]@{ device='priority'; error=$_.Exception.Message })
+            if ($ApplyMode -eq 'Strict') { throw }
         }
-        $priorityPlanPath = Join-Path $backupPath 'priority-plan.json'
-        [IO.File]::WriteAllText($priorityPlanPath, ($priorityPlan | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
-        & (Join-Path $PSScriptRoot 'Set-AudioPriority.ps1') -Mode Controller -PlanPath $priorityPlanPath -Json | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "Priority worker exited with code $LASTEXITCODE." }
     }
 
     $postInventory = @(Get-WindowsAudioInventory)
-    $differences = @(Get-AudioProfileDifferences -Profile $profile -ResolvedDevices $resolved -Inventory $postInventory)
+    $differences = @(Get-AudioProfileDifferences -Profile $profile -ResolvedDevices $resolved -Inventory $postInventory -VerifiedVolumeKeys @($verifiedVolumeKeys))
     foreach ($difference in $differences) { $errors.Add([pscustomobject]@{ device=$difference.device; error="Verification failed for $($difference.property)." }) }
     if ($differences.Count -gt 0 -and $ApplyMode -eq 'Strict') { throw "Post-apply verification found $($differences.Count) difference(s)." }
     $verified = $errors.Count -eq 0
@@ -196,7 +209,7 @@ catch {
     $failure = $_.Exception.Message
     if ($ApplyMode -eq 'Strict' -and $null -ne $backupPath -and (Test-Path -LiteralPath (Join-Path $backupPath 'state.json'))) {
         try {
-            & (Join-Path $PSScriptRoot 'Undo-AudioProfile.ps1') -BackupPath $backupPath -InternalElevated -Json -Confirm:$false | Out-Null
+            & (Join-Path $PSScriptRoot 'Undo-AudioProfile.ps1') -BackupPath $backupPath -InternalElevated -Json | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Undo exited with code $LASTEXITCODE." }
             $rolledBack = $true
         }

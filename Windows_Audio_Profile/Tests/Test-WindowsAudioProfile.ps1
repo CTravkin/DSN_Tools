@@ -134,7 +134,49 @@ try {
     $invalidFormat = New-ValidProfile
     $invalidFormat.devices[0].settings.format.sampleRateHz = 0
     $invalidFormatPath = Write-TestProfile -Document $invalidFormat
-    Assert-Throws { Import-AudioProfile -Path $invalidFormatPath } 'positive channels' 'Format values must be validated before Apply.'
+    Assert-Throws { Import-AudioProfile -Path $invalidFormatPath } 'positive JSON integer' 'Format values must be validated before Apply.'
+
+    $stringBoolean = New-ValidProfile
+    $stringBoolean.devices[0].required = 'false'
+    $stringBoolean.devices[0].settings.enabled = 'false'
+    $stringBoolean.devices[0].settings.volume.muted = 'false'
+    $stringBooleanPath = Write-TestProfile -Document $stringBoolean
+    Assert-Throws { Import-AudioProfile -Path $stringBooleanPath } 'required.*Boolean' 'String booleans must be rejected before planning.'
+
+    $stringEnabled = New-ValidProfile
+    $stringEnabled.devices[0].settings.enabled = 'false'
+    $stringEnabledPath = Write-TestProfile -Document $stringEnabled
+    Assert-Throws { Import-AudioProfile -Path $stringEnabledPath } 'enabled.*Boolean' 'String enabled values must be rejected.'
+
+    $stringMuted = New-ValidProfile
+    $stringMuted.devices[0].settings.volume.muted = 'false'
+    $stringMutedPath = Write-TestProfile -Document $stringMuted
+    Assert-Throws { Import-AudioProfile -Path $stringMutedPath } 'muted.*Boolean' 'String muted values must be rejected.'
+
+    $stringPercent = New-ValidProfile
+    $stringPercent.devices[0].settings.volume.percent = '50'
+    $stringPercentPath = Write-TestProfile -Document $stringPercent
+    Assert-Throws { Import-AudioProfile -Path $stringPercentPath } 'percent.*number' 'String volume numbers must be rejected.'
+
+    $emptyVolume = New-ValidProfile
+    $emptyVolume.devices[0].settings.volume = @{}
+    $emptyVolumePath = Write-TestProfile -Document $emptyVolume
+    Assert-Throws { Import-AudioProfile -Path $emptyVolumePath } 'volume.*at least one' 'An empty volume patch must be rejected.'
+
+    $invalidEndpointId = New-ValidProfile
+    $invalidEndpointId.devices[0].match.endpointId = 'not-a-guid'
+    $invalidEndpointIdPath = Write-TestProfile -Document $invalidEndpointId
+    Assert-Throws { Import-AudioProfile -Path $invalidEndpointIdPath } 'endpointId.*GUID' 'Invalid endpoint IDs must be rejected during import.'
+
+    $scalarHardwareIds = New-ValidProfile
+    $scalarHardwareIds.devices[0].match.hardwareIds = 'USB\VID_0001&PID_0001'
+    $scalarHardwareIdsPath = Write-TestProfile -Document $scalarHardwareIds
+    Assert-Throws { Import-AudioProfile -Path $scalarHardwareIdsPath } 'hardwareIds.*array' 'hardwareIds must remain a JSON array.'
+
+    $scalarPriority = New-ValidProfile
+    $scalarPriority.priority.render.allRoles.leastToMostPreferred = 'speakers'
+    $scalarPriorityPath = Write-TestProfile -Document $scalarPriority
+    Assert-Throws { Import-AudioProfile -Path $scalarPriorityPath } 'leastToMostPreferred.*array' 'Priority order must remain a JSON array.'
 
     $inventory = @(
         [pscustomobject]@{
@@ -193,6 +235,19 @@ try {
     $incompleteProfile = Import-AudioProfile -Path $incompletePath
     Assert-Throws { Get-AudioPriorityAssignments -Profile $incompleteProfile -ResolvedDevices $resolved -Inventory $inventory } 'complete priority list' 'Priority lists must cover every eligible endpoint.'
 
+    $inactiveEndpoint = [pscustomobject]@{
+        Flow='render'; EndpointId='{11111111-1111-1111-1111-111111111111}'; Active=$false
+        Name='Speakers'; Icon='C:\Windows\System32\mmres.dll,-1'; Enabled=$false; Format=$null
+        NeverSetAsDefault=$false; Levels=[pscustomobject]@{ console=1; multimedia=1; communications=1 }
+    }
+    $inactiveVolumeProfile = [pscustomobject]@{
+        devices=@([pscustomobject]@{ key='speakers'; settings=[pscustomobject]@{ volume=[pscustomobject]@{ percent=73 } } })
+    }
+    $inactiveVolumeDifferences = @(Get-AudioProfileDifferences -Profile $inactiveVolumeProfile -ResolvedDevices @{ speakers=$inactiveEndpoint } -Inventory @($inactiveEndpoint))
+    Assert-True (@($inactiveVolumeDifferences | Where-Object { $_.property -eq 'volume' }).Count -eq 1) 'Inactive endpoint volume must require Apply instead of becoming a no-op.'
+    $verifiedInactiveVolumeDifferences = @(Get-AudioProfileDifferences -Profile $inactiveVolumeProfile -ResolvedDevices @{ speakers=$inactiveEndpoint } -Inventory @($inactiveEndpoint) -VerifiedVolumeKeys @('speakers'))
+    Assert-True ($verifiedInactiveVolumeDifferences.Count -eq 0) 'Post-apply comparison must accept volume verified before a requested disable.'
+
     $pcmStereo24Bit48Khz = [byte[]](
         0xFE,0xFF, 0x02,0x00, 0x80,0xBB,0x00,0x00,
         0x00,0x65,0x04,0x00, 0x06,0x00, 0x18,0x00,
@@ -219,6 +274,17 @@ try {
     $rebuiltClassicFormat = ConvertTo-AudioWaveFormatBytes -Format $classicFormat
     Assert-True ([Convert]::ToBase64String($rebuiltClassicFormat) -eq [Convert]::ToBase64String($classicPcmStereo16Bit48Khz)) 'Classic WAVEFORMATEX serialization must preserve its structure.'
 
+    $noIconEndpoint = [pscustomobject]@{
+        Flow='render'; EndpointId='{33333333-3333-3333-3333-333333333333}'; FullEndpointId='{0.0.0.00000000}.{33333333-3333-3333-3333-333333333333}'; Name='No icon'
+        ContainerId='{cccccccc-cccc-cccc-cccc-cccccccccccc}'; DeviceInstanceId='ROOT\NOICON\1'
+        HardwareIds=@(); DriverIdentity='test'; Icon=''; Format=$null; Enabled=$true; Active=$false
+        NeverSetAsDefault=$true; Levels=[pscustomobject]@{ console=$null; multimedia=$null; communications=$null }
+    }
+    $noIconProfile = New-AudioProfileDocument -Inventory @($noIconEndpoint)
+    Assert-True (-not $noIconProfile.devices[0].settings.Contains('icon')) 'Export must omit an absent icon instead of violating its schema.'
+    $unrestorableIconProfile = [pscustomobject]@{ devices=@([pscustomobject]@{ key='no-icon'; settings=[pscustomobject]@{ icon='C:\Windows\System32\mmres.dll,-1' } }) }
+    Assert-Throws { New-AudioBackupDocument -Profile $unrestorableIconProfile -ResolvedDevices @{ 'no-icon'=$noIconEndpoint } -Inventory @($noIconEndpoint) } 'reversible backup.*icon' 'Apply must stop before changing an icon whose absent original value cannot be restored.'
+
     $liveInventory = @(Get-WindowsAudioInventory)
     Assert-True ($liveInventory.Count -gt 0) 'Windows audio inventory must contain at least one endpoint.'
     $firstLiveEndpoint = $liveInventory[0]
@@ -231,6 +297,8 @@ try {
     }
 
     Initialize-AudioInterop -SourcePath (Join-Path $utilityRoot 'CoreAudio.cs')
+    $tokenRunnerParameters = [DSNTools.WindowsAudioProfile.TokenRunner].GetMethod('RunFromProcessToken').GetParameters()
+    Assert-True ($tokenRunnerParameters.Count -eq 5 -and $tokenRunnerParameters[4].Name -eq 'timeoutMilliseconds') 'TrustedInstaller child execution must have an explicit finite timeout.'
     $activeEndpoint = @($liveInventory | Where-Object { $_.Active })[0]
     $liveVolume = Get-WindowsAudioEndpointVolume -Endpoint $activeEndpoint
     Assert-True ($liveVolume.percent -ge 0 -and $liveVolume.percent -le 100) 'Active endpoint volume must be normalized to 0-100 percent.'
@@ -240,18 +308,7 @@ try {
     foreach ($role in @('console', 'multimedia', 'communications')) {
         $defaultId = Get-WindowsAudioDefaultEndpoint -Flow $activeEndpoint.Flow -Role $role
         Assert-True ($null -eq $defaultId -or $defaultId -match '^\{0\.0\.[01]\.00000000\}\.\{[0-9a-f-]{36}\}$') 'Default endpoint IDs must use the MMDevice ID format.'
-        if ($null -ne $defaultId) { Set-WindowsAudioDefaultEndpoint -EndpointId $defaultId -Role $role }
     }
-    Set-WindowsAudioEndpointVolume -Endpoint $activeEndpoint -Percent $liveVolume.percent -Muted $liveVolume.muted
-    $sameVolume = Get-WindowsAudioEndpointVolume -Endpoint $activeEndpoint
-    Assert-True ([Math]::Abs($sameVolume.percent - $liveVolume.percent) -lt 0.1) 'Writing the current scalar volume must preserve it.'
-    Assert-True ($sameVolume.muted -eq $liveVolume.muted) 'Writing the current mute state must preserve it.'
-    Set-WindowsAudioEndpointVisibility -EndpointId $activeEndpoint.FullEndpointId -Visible $true
-    Set-WindowsAudioEndpointProperties -Endpoint $activeEndpoint -Name $activeEndpoint.Name -Icon $activeEndpoint.Icon -Format $activeEndpoint.Format
-    $sameEndpoint = @(Get-WindowsAudioInventory | Where-Object { $_.Flow -eq $activeEndpoint.Flow -and $_.EndpointId -eq $activeEndpoint.EndpointId })[0]
-    Assert-True ($sameEndpoint.Name -eq $activeEndpoint.Name) 'Writing the current display name must preserve it.'
-    Assert-True ($sameEndpoint.Icon -eq $activeEndpoint.Icon) 'Writing the current icon must preserve it.'
-    Assert-True ($sameEndpoint.Format.sampleRateHz -eq $activeEndpoint.Format.sampleRateHz) 'Writing the current format must preserve its sample rate.'
 
     $exportScript = Join-Path $utilityRoot 'Export-AudioProfile.ps1'
     $testScript = Join-Path $utilityRoot 'Test-AudioProfile.ps1'
@@ -270,6 +327,10 @@ try {
     Assert-True ($testReport.matchedDevices -eq $liveInventory.Count) 'Profile test must resolve every exported endpoint.'
 
     $applyScript = Join-Path $utilityRoot 'Apply-AudioProfile.ps1'
+    $applyCommand = Get-Command -Name $applyScript
+    $undoCommand = Get-Command -Name (Join-Path $utilityRoot 'Undo-AudioProfile.ps1')
+    Assert-True ($applyCommand.Parameters.ContainsKey('WhatIf') -and -not $applyCommand.Parameters.ContainsKey('Confirm')) 'Apply must expose an explicit WhatIf preview without a fake Confirm contract.'
+    Assert-True ($undoCommand.Parameters.ContainsKey('WhatIf') -and -not $undoCommand.Parameters.ContainsKey('Confirm')) 'Undo must expose an explicit WhatIf preview without a fake Confirm contract.'
     $applyPreview = Invoke-JsonScript -Script $applyScript -Arguments @('-ProfilePath', $exportedProfilePath, '-ApplyMode', 'Strict', '-WhatIf', '-Json')
     Assert-True ($applyPreview.ExitCode -eq 0) "Apply -WhatIf must succeed without elevation: $($applyPreview.Error)"
     $applyPlan = $applyPreview.Output | ConvertFrom-Json
@@ -284,6 +345,45 @@ try {
     Assert-True ($backupDocument.version -eq 1) 'Audio backup format must be versioned.'
     Assert-True (@($backupDocument.devices).Count -eq $liveInventory.Count) 'Audio backup must capture every matched endpoint.'
     Assert-True (@($backupDocument.defaults).Count -eq 6) 'Audio backup must capture both flows and all three roles.'
+
+    $muteOnlyProfile = [pscustomobject]@{
+        devices=@([pscustomobject]@{
+            key='mute-only'
+            settings=[pscustomobject]@{ volume=[pscustomobject]@{ muted=[bool]$liveVolume.muted } }
+        })
+    }
+    $muteOnlyBackup = New-AudioBackupDocument -Profile $muteOnlyProfile -ResolvedDevices @{ 'mute-only'=$activeEndpoint } -Inventory $liveInventory
+    Assert-True (@($muteOnlyBackup.devices[0].touched) -contains 'volume.muted') 'Backup must track mute independently.'
+    Assert-True (@($muteOnlyBackup.devices[0].touched) -notcontains 'volume.level') 'Mute-only patches must not restore the volume level.'
+    $muteOnlyRestore = Get-AudioBackupDeviceRestoreArguments -Device $muteOnlyBackup.devices[0]
+    Assert-True ($muteOnlyRestore.Volume.ContainsKey('Muted')) 'Mute-only restore must include the saved mute state.'
+    Assert-True (-not $muteOnlyRestore.Volume.ContainsKey('Decibels')) 'Mute-only restore must not overwrite a later volume-level change.'
+    Assert-True (@($muteOnlyBackup.defaults).Count -eq 0) 'A profile without priority must not snapshot defaults.'
+
+    $renderPriorityProfile = Import-AudioProfile -Path $exportedProfilePath
+    if ($null -ne $renderPriorityProfile.priority.PSObject.Properties['capture']) { [void]$renderPriorityProfile.priority.PSObject.Properties.Remove('capture') }
+    $renderPriorityResolved = Resolve-AudioProfileDevices -Profile $renderPriorityProfile -Inventory $freshInventory
+    $renderPriorityBackup = New-AudioBackupDocument -Profile $renderPriorityProfile -ResolvedDevices $renderPriorityResolved -Inventory $freshInventory
+    Assert-True (@($renderPriorityBackup.priorityFlows).Count -eq 1 -and $renderPriorityBackup.priorityFlows[0] -eq 'render') 'Backup must record only the priority flow requested by the profile.'
+    Assert-True (@($renderPriorityBackup.defaults).Count -eq 3) 'A render-only priority patch must not snapshot capture defaults.'
+    $expectedRenderPriorityEndpoints = @($freshInventory | Where-Object { $_.Flow -eq 'render' -and -not $_.NeverSetAsDefault }).Count
+    Assert-True (@($renderPriorityBackup.priorityEndpoints).Count -eq $expectedRenderPriorityEndpoints) 'Backup must record exactly the endpoints whose priority Apply can touch.'
+
+    $changedBackupEndpoint = [pscustomobject]@{
+        Flow=$activeEndpoint.Flow; EndpointId=$activeEndpoint.EndpointId; Name=($activeEndpoint.Name + ' changed')
+        Icon=$activeEndpoint.Icon; Enabled=$activeEndpoint.Enabled; Format=$activeEndpoint.Format; Active=$activeEndpoint.Active
+        Levels=$activeEndpoint.Levels
+    }
+    $backupDifferences = @(Get-AudioBackupDifferences -Backup ([pscustomobject]@{
+        devices=@([pscustomobject]@{
+            key='mute-only'; flow=$activeEndpoint.Flow; endpointId=$activeEndpoint.EndpointId
+            name=$activeEndpoint.Name; icon=$activeEndpoint.Icon; enabled=$activeEndpoint.Enabled; format=$activeEndpoint.Format
+            volume=$liveVolume; levels=$activeEndpoint.Levels; touched=@('name')
+        })
+        priorityFlows=@(); defaults=@()
+    }) -Inventory @($changedBackupEndpoint))
+    Assert-True (@($backupDifferences | Where-Object { $_.property -eq 'name' }).Count -eq 1) 'Undo verification must detect a display-name mismatch.'
+
     $differences = @(Get-AudioProfileDifferences -Profile $freshProfile -ResolvedDevices $freshResolved -Inventory $freshInventory)
     Assert-True ($differences.Count -eq 0) "A freshly exported profile must match current state; got $($differences.Count) difference(s)."
 

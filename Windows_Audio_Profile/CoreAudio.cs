@@ -387,8 +387,8 @@ namespace DSNTools.WindowsAudioProfile
         private const int SecurityImpersonation = 2;
         private const int TokenPrimary = 1;
         private const uint CreateNoWindow = 0x08000000;
-        private const uint Infinite = 0xFFFFFFFF;
         private const uint WaitFailed = 0xFFFFFFFF;
+        private const uint WaitTimeout = 0x00000102;
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct StartupInfo
@@ -438,6 +438,9 @@ namespace DSNTools.WindowsAudioProfile
         private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
 
         [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 
         [DllImport("kernel32.dll")]
@@ -448,7 +451,7 @@ namespace DSNTools.WindowsAudioProfile
             return new Win32Exception(Marshal.GetLastWin32Error(), operation);
         }
 
-        public static uint RunFromProcessToken(uint sourceProcessId, string applicationPath, string arguments, string workingDirectory)
+        public static uint RunFromProcessToken(uint sourceProcessId, string applicationPath, string arguments, string workingDirectory, uint timeoutMilliseconds)
         {
             IntPtr process = IntPtr.Zero;
             IntPtr sourceToken = IntPtr.Zero;
@@ -464,7 +467,14 @@ namespace DSNTools.WindowsAudioProfile
                 startupInfo.Size = Marshal.SizeOf(typeof(StartupInfo));
                 StringBuilder commandLine = new StringBuilder(arguments);
                 if (!CreateProcessWithTokenW(primaryToken, 0, applicationPath, commandLine, CreateNoWindow, IntPtr.Zero, workingDirectory, ref startupInfo, out processInformation)) throw LastError("CreateProcessWithTokenW failed");
-                if (WaitForSingleObject(processInformation.Process, Infinite) == WaitFailed) throw LastError("WaitForSingleObject failed");
+                uint waitResult = WaitForSingleObject(processInformation.Process, timeoutMilliseconds);
+                if (waitResult == WaitTimeout)
+                {
+                    if (!TerminateProcess(processInformation.Process, 1460)) throw LastError("TerminateProcess failed after timeout");
+                    WaitForSingleObject(processInformation.Process, 5000);
+                    throw new TimeoutException("TrustedInstaller child process exceeded its execution timeout.");
+                }
+                if (waitResult == WaitFailed) throw LastError("WaitForSingleObject failed");
                 uint exitCode;
                 if (!GetExitCodeProcess(processInformation.Process, out exitCode)) throw LastError("GetExitCodeProcess failed");
                 return exitCode;

@@ -65,6 +65,8 @@ Priority arrays are ordered from least to most preferred. `allRoles` covers Cons
 
 See [audio-profile.example.json](audio-profile.example.json) and [audio-profile.schema.json](audio-profile.schema.json).
 
+`Test` and `Apply` validate JSON token types before PowerShell converts the document. Strings such as `"false"` or `"50"` are rejected where a Boolean or number is required.
+
 ## Device matching
 
 The current endpoint ID is tried first. If Windows recreated the endpoint, the utility requires at least two exported stable identity anchors, such as the PnP container ID, device instance ID, or hardware IDs. Display names are never identity keys. Zero or multiple matches fail closed. Set `required` to `false` only when an absent device should produce a warning.
@@ -73,9 +75,9 @@ Exported profiles are bound to the current Windows installation by a SHA-256 has
 
 ## Elevation and backups
 
-`Apply` and `Undo` request UAC only when a change is required. Normal endpoint properties use Core Audio. Exact default priority levels require a short-lived scheduled task under SYSTEM and a process token from the Windows Modules Installer (`TrustedInstaller`) service. The task is removed after the operation; no service or background helper is installed.
+`Apply` and `Undo` request UAC only when a change is required. Normal endpoint properties use Core Audio. Exact default priority levels require a short-lived scheduled task under SYSTEM and a process token from the Windows Modules Installer (`TrustedInstaller`) service. Priority code and data are copied to a temporary ACL-protected directory under ProgramData and verified by SHA-256 before privileged execution. The helper has a finite timeout. The task, staging directory, and any temporary service start are cleaned up after the operation; no service or background helper is installed.
 
-Before changing anything, `Apply` writes `state.json` under `Backups/<timestamp>-<id>` by default. Use `-BackupRoot` to select another location. `Undo` restores only properties touched by the source profile and its saved priority levels.
+Before changing anything, `Apply` verifies that every touched property can be backed up, then writes `state.json` under `Backups/<timestamp>-<id>` by default. Use `-BackupRoot` to select another location. `Undo` restores and verifies only the exact fields and priority flows touched by the source profile. A restore mismatch is reported as a failure.
 
 ## Limitations
 
@@ -87,10 +89,10 @@ Before changing anything, `Apply` writes `state.json` under `Backups/<timestamp>
 
 ## Tests
 
-Run the normal suite without elevation:
+The normal suite is read-only and does not require elevation:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Tests\Test-WindowsAudioProfile.ps1
 ```
 
-`Tests\Test-ElevatedApply.ps1` is an explicit integration test. Run it from an elevated Windows PowerShell session only when temporary priority changes are acceptable. It swaps two lowest-priority endpoints, verifies the change, and restores the original levels with `Undo`.
+`Tests\Test-ElevatedApply.ps1` is an explicit integration test. Run it from an elevated Windows PowerShell session only when temporary priority and endpoint-name changes are acceptable. It verifies protected staging, exercises strict rollback and a BestEffort priority failure, checks actual state after Apply and Undo, then restores the original state and checks cleanup.
