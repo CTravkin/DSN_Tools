@@ -142,6 +142,12 @@ try {
     Assert-True (@($profile.devices).Count -eq 2) 'A valid profile must retain both devices.'
     Assert-Throws { Import-AudioProfile -Path $validPath -ExpectedSha256 ('0' * 64) } 'hash verification failed' 'Apply input must be bound to the pre-elevation profile hash.'
 
+    $module = Get-Module WindowsAudioProfile
+    Assert-True (& $module { Test-AudioEndpointVisibleState -DeviceState 1 }) 'An active endpoint without the visibility bit must be enabled.'
+    Assert-True (& $module { Test-AudioEndpointVisibleState -DeviceState 8 }) 'An unplugged endpoint without the visibility bit must remain enabled.'
+    Assert-True (-not (& $module { Test-AudioEndpointVisibleState -DeviceState 268435457 })) 'An active endpoint with the Windows hidden bit must be disabled.'
+    Assert-True (-not (& $module { Test-AudioEndpointVisibleState -DeviceState 268435464 })) 'An unplugged endpoint with the Windows hidden bit must be disabled.'
+
     $schema = Get-Content -Raw -LiteralPath (Join-Path $utilityRoot 'audio-profile.schema.json') | ConvertFrom-Json
     $stableIdPattern = [string]$schema.'$defs'.device.properties.match.properties.stableId.pattern
     Assert-True (-not [string]::IsNullOrWhiteSpace($stableIdPattern) -and -not ('   ' -match $stableIdPattern)) 'The JSON schema must reject whitespace-only StableId values.'

@@ -117,6 +117,12 @@ function ConvertTo-AudioWaveFormatBytes {
     $bytes
 }
 
+function Test-AudioEndpointVisibleState {
+    param([Parameter(Mandatory)][uint32]$DeviceState)
+
+    -not [bool]($DeviceState -band 0x10000000)
+}
+
 function Get-WindowsAudioInventory {
     [CmdletBinding()]
     param()
@@ -190,7 +196,7 @@ function Get-WindowsAudioInventory {
                 Icon = [string](& $readProperty $propertyNames.Icon)
                 Format = $format
                 DeviceState = $state
-                Enabled = -not [bool]($state -band 2)
+                Enabled = Test-AudioEndpointVisibleState -DeviceState $state
                 Active = [bool]($state -band 1)
                 NeverSetAsDefault = $null -ne $neverSetValue -and [int64]$neverSetValue -ne 0
                 Levels = [pscustomobject]$levels
