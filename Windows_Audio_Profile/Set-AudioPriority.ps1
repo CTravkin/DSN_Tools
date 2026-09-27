@@ -15,12 +15,42 @@ function Import-PriorityPlan {
     param([Parameter(Mandatory)][string]$Path, [string]$ExpectedSha256)
 
     $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $bytes = [IO.File]::ReadAllBytes($resolved)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $actualSha256 = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','').ToLowerInvariant() }
+    finally { $sha.Dispose() }
     if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
-        $actualSha256 = (Get-FileHash -LiteralPath $resolved -Algorithm SHA256).Hash.ToLowerInvariant()
         if (-not [string]::Equals($actualSha256, $ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) { throw 'Priority plan hash verification failed.' }
     }
-    $plan = [IO.File]::ReadAllText($resolved, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
-    if ($null -eq $plan.version -or [int]$plan.version -ne 1) { throw 'Unsupported priority plan version; expected 1.' }
+    $offset = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 3 } else { 0 }
+    $json = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $offset, $bytes.Length - $offset)
+    Add-Type -AssemblyName System.Web.Extensions
+    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $serializer.MaxJsonLength = 16777216
+    $raw = $serializer.DeserializeObject($json)
+    if ($raw -isnot [Collections.IDictionary]) { throw 'Priority plan root must be a JSON object.' }
+    foreach ($name in $raw.Keys) { if ([string]$name -notin @('version','machineIdSha256','assignments')) { throw "Unknown property '$name' in priority plan." } }
+    $version = $raw['version']
+    if ($version -isnot [byte] -and $version -isnot [sbyte] -and $version -isnot [int16] -and $version -isnot [uint16] -and $version -isnot [int32] -and $version -isnot [uint32] -and $version -isnot [int64] -and $version -isnot [uint64]) { throw 'Priority plan version must be a JSON integer.' }
+    if ([int64]$version -ne 1) { throw 'Unsupported priority plan version; expected 1.' }
+    if ($raw['machineIdSha256'] -isnot [string] -or [string]$raw['machineIdSha256'] -notmatch '^[0-9a-fA-F]{64}$') { throw 'Priority plan machineIdSha256 must contain 64 hexadecimal characters.' }
+    if ($raw['assignments'] -isnot [array]) { throw 'Priority plan assignments must be a JSON array.' }
+    foreach ($assignment in @($raw['assignments'])) {
+        if ($assignment -isnot [Collections.IDictionary]) { throw 'Every priority assignment must be a JSON object.' }
+        foreach ($name in $assignment.Keys) { if ([string]$name -notin @('flow','endpointId','roleIndex','hasValue','level')) { throw "Unknown property '$name' in priority assignment." } }
+        if ($assignment['flow'] -isnot [string] -or [string]$assignment['flow'] -notin @('render','capture')) { throw 'Priority assignment flow must be render or capture.' }
+        if ($assignment['endpointId'] -isnot [string] -or [string]$assignment['endpointId'] -notmatch '^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$') { throw 'Priority assignment endpointId must be a braced GUID.' }
+        $roleIndex = $assignment['roleIndex']
+        if ($roleIndex -isnot [byte] -and $roleIndex -isnot [sbyte] -and $roleIndex -isnot [int16] -and $roleIndex -isnot [uint16] -and $roleIndex -isnot [int32] -and $roleIndex -isnot [uint32] -and $roleIndex -isnot [int64] -and $roleIndex -isnot [uint64]) { throw 'Priority assignment roleIndex must be a JSON integer.' }
+        if ([int64]$roleIndex -lt 0 -or [int64]$roleIndex -gt 2) { throw 'Priority assignment roleIndex must be between 0 and 2.' }
+        if ($assignment['hasValue'] -isnot [bool]) { throw 'Priority assignment hasValue must be a JSON Boolean.' }
+        $level = $assignment['level']
+        if ([bool]$assignment['hasValue']) {
+            if ($level -isnot [byte] -and $level -isnot [sbyte] -and $level -isnot [int16] -and $level -isnot [uint16] -and $level -isnot [int32] -and $level -isnot [uint32] -and $level -isnot [int64] -and $level -isnot [uint64]) { throw 'Priority assignment level must be a JSON integer when hasValue is true.' }
+        }
+        elseif ($null -ne $level) { throw 'Priority assignment level must be null when hasValue is false.' }
+    }
+    $plan = $json | ConvertFrom-Json
     Import-Module (Join-Path $PSScriptRoot 'WindowsAudioProfile.psm1') -Force
     if (-not [string]::Equals([string]$plan.machineIdSha256, (Get-AudioMachineHash), [StringComparison]::OrdinalIgnoreCase)) {
         throw 'Priority plan belongs to a different Windows installation.'
@@ -36,7 +66,7 @@ function Import-PriorityPlan {
         $endpointPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\$registryFlow\$($assignment.endpointId)"
         if (-not (Test-Path -LiteralPath $endpointPath -PathType Container)) { throw "Priority endpoint is not registered: $identity" }
     }
-    [pscustomobject]@{ Path=$resolved; Plan=$plan; Count=@($plan.assignments).Count }
+    [pscustomobject]@{ Path=$resolved; Plan=$plan; Count=@($plan.assignments).Count; Bytes=$bytes; Sha256=$actualSha256 }
 }
 
 function Get-PriorityBundleHash {
@@ -153,8 +183,8 @@ try {
             Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $stagingPath $name)
         }
         $stagedPlan = Join-Path $stagingPath 'plan.json'
-        Copy-Item -LiteralPath $validated.Path -Destination $stagedPlan
-        $stagedPlanHash = (Get-FileHash -LiteralPath $stagedPlan -Algorithm SHA256).Hash.ToLowerInvariant()
+        [IO.File]::WriteAllBytes($stagedPlan, $validated.Bytes)
+        $stagedPlanHash = $validated.Sha256
         $stagedBundleHash = Get-PriorityBundleHash -Directory $stagingPath
         $stagedScript = Join-Path $stagingPath 'Set-AudioPriority.ps1'
         $resultPath = "$stagedPlan.result.json"

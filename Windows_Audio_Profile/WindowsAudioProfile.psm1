@@ -407,12 +407,19 @@ function ConvertFrom-AudioJsonDocument {
     $serializer.DeserializeObject($Json)
 }
 
-function Assert-AudioExpectedFileHash {
+function Read-AudioJsonSnapshot {
     param([Parameter(Mandatory)][string]$Path, [string]$ExpectedSha256, [string]$Context = 'JSON file')
-    if ([string]::IsNullOrWhiteSpace($ExpectedSha256)) { return }
-    if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "$Context expected SHA-256 must contain 64 hexadecimal characters." }
-    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
-    if (-not [string]::Equals($actual, $ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) { throw "$Context hash verification failed." }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $actual = ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-','') }
+    finally { $sha.Dispose() }
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedSha256)) {
+        if ($ExpectedSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "$Context expected SHA-256 must contain 64 hexadecimal characters." }
+        if (-not [string]::Equals($actual, $ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) { throw "$Context hash verification failed." }
+    }
+    $offset = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 3 } else { 0 }
+    $json = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $offset, $bytes.Length - $offset)
+    [pscustomobject]@{ Json=$json; Sha256=$actual }
 }
 
 function Assert-AudioRawPriorityOrder {
@@ -454,6 +461,7 @@ function Assert-AudioRawProfileContract {
         if ($target.ContainsKey('machineIdSha256') -and [string]$target['machineIdSha256'] -notmatch '^[0-9a-fA-F]{64}$') { throw 'target.machineIdSha256 must contain 64 hexadecimal characters.' }
         Assert-AudioRawString -Object $target -Name 'binding' -Context 'target'
         if ($target.ContainsKey('binding') -and [string]$target['binding'] -notin @('strict', 'none')) { throw 'target.binding must be strict or none.' }
+        if ($target.ContainsKey('binding') -and [string]$target['binding'] -eq 'strict' -and -not $target.ContainsKey('machineIdSha256')) { throw 'target.machineIdSha256 is required when target.binding is strict.' }
     }
 
     if (-not $Raw.ContainsKey('devices') -or $Raw['devices'] -isnot [array] -or @($Raw['devices']).Count -lt 1) {
@@ -561,6 +569,7 @@ function Assert-AudioRawBackupContract {
 
     $allowedTouched = @('name','icon','enabled','format','volume','volume.level','volume.muted')
     $seenDevices = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $deviceIdentities = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($device in @($Raw['devices'])) {
         if ($device -isnot [Collections.IDictionary]) { throw 'Every audio backup devices item must be a JSON object.' }
         Assert-AudioRawAllowedProperties -Object $device -Allowed @('key','flow','endpointId','fullEndpointId','name','icon','enabled','format','volume','levels','touched') -Context 'audio backup device'
@@ -569,6 +578,7 @@ function Assert-AudioRawBackupContract {
         if ([string]::IsNullOrWhiteSpace($key) -or -not $seenDevices.Add($key)) { throw 'audio backup device keys must be non-empty and unique.' }
         if ([string]$device['flow'] -notin @('render','capture')) { throw "Audio backup device '$key'.flow must be render or capture." }
         if ([string]$device['endpointId'] -notmatch '^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$') { throw "Audio backup device '$key'.endpointId must be a braced GUID." }
+        if (-not $deviceIdentities.Add("$($device['flow'])/$($device['endpointId'])")) { throw 'audio backup devices must not contain duplicate flow/endpoint identities.' }
         $expectedFullFlow = if ([string]$device['flow'] -eq 'render') { '0' } else { '1' }
         if ([string]$device['fullEndpointId'] -notmatch ("^\{0\.0\.$expectedFullFlow\.00000000\}\." + [regex]::Escape([string]$device['endpointId']) + '$')) { throw "Audio backup device '$key'.fullEndpointId does not match its flow and endpointId." }
         if ($device['enabled'] -isnot [bool]) { throw "Audio backup device '$key'.enabled must be a JSON Boolean." }
@@ -616,6 +626,16 @@ function Assert-AudioRawBackupContract {
         }
     }
 
+    if ([bool]$Raw['priorityIncluded']) {
+        if ($seenPriorityEndpoints.Count -lt 1) { throw 'audio backup.priorityEndpoints must not be empty when priorityIncluded is true.' }
+        foreach ($flow in @($Raw['priorityFlows'])) {
+            if (@($Raw['priorityEndpoints'] | Where-Object { [string]$_['flow'] -eq [string]$flow }).Count -lt 1) { throw "audio backup.priorityEndpoints must include at least one endpoint for $flow." }
+        }
+        foreach ($identity in $seenPriorityEndpoints) {
+            if (-not $deviceIdentities.Contains($identity)) { throw "Audio backup priority endpoint '$identity' has no matching device snapshot." }
+        }
+    }
+
     $seenDefaults = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($default in @($Raw['defaults'])) {
         if ($default -isnot [Collections.IDictionary]) { throw 'Every audio backup defaults item must be a JSON object.' }
@@ -624,7 +644,10 @@ function Assert-AudioRawBackupContract {
         if ([string]$default['flow'] -notin @('render','capture')) { throw 'audio backup default.flow must be render or capture.' }
         if ([string]$default['role'] -notin @('console','multimedia','communications')) { throw 'audio backup default.role is invalid.' }
         if (@($Raw['priorityFlows']) -notcontains [string]$default['flow']) { throw 'audio backup default belongs to a flow that is not included.' }
-        if ([string]$default['endpointId'] -notmatch '^\{0\.0\.[01]\.00000000\}\.\{[0-9a-fA-F-]{36}\}$') { throw 'audio backup default.endpointId must be a full MMDevice endpoint ID.' }
+        $defaultFlowIndex = if ([string]$default['flow'] -eq 'render') { '0' } else { '1' }
+        if ([string]$default['endpointId'] -notmatch ("^\{0\.0\.$defaultFlowIndex\.00000000\}\.\{[0-9a-fA-F-]{36}\}$")) { throw 'audio backup default.endpointId must be a full MMDevice endpoint ID for its flow.' }
+        $defaultEndpointId = ([regex]::Match([string]$default['endpointId'], '\{[0-9a-fA-F-]{36}\}$')).Value
+        if (-not $seenPriorityEndpoints.Contains("$($default['flow'])/$defaultEndpointId")) { throw 'audio backup default must reference an exact priorityEndpoints member.' }
         if (-not $seenDefaults.Add("$($default['flow'])/$($default['role'])")) { throw 'audio backup defaults must not contain duplicate flow/role entries.' }
     }
     if ([bool]$Raw['priorityIncluded'] -and @($Raw['defaults']).Count -ne (3 * @($Raw['priorityFlows']).Count)) { throw 'audio backup defaults must contain all three roles for every priority flow.' }
@@ -666,8 +689,8 @@ function Import-AudioProfile {
     param([Parameter(Mandatory)][string]$Path, [string]$ExpectedSha256)
 
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
-    Assert-AudioExpectedFileHash -Path $resolvedPath -ExpectedSha256 $ExpectedSha256 -Context 'Audio profile'
-    $json = [IO.File]::ReadAllText($resolvedPath, [Text.UTF8Encoding]::new($false, $true))
+    $snapshot = Read-AudioJsonSnapshot -Path $resolvedPath -ExpectedSha256 $ExpectedSha256 -Context 'Audio profile'
+    $json = $snapshot.Json
     $rawDocument = ConvertFrom-AudioJsonDocument -Json $json
     Assert-AudioRawProfileContract -Raw $rawDocument
     $document = $json | ConvertFrom-Json
@@ -737,8 +760,8 @@ function Import-AudioBackup {
 
     $resolved = (Resolve-Path -LiteralPath $Path).Path
     $backupFile = if (Test-Path -LiteralPath $resolved -PathType Container) { Join-Path $resolved 'state.json' } else { $resolved }
-    Assert-AudioExpectedFileHash -Path $backupFile -ExpectedSha256 $ExpectedSha256 -Context 'Audio backup'
-    $json = [IO.File]::ReadAllText($backupFile, [Text.UTF8Encoding]::new($false, $true))
+    $snapshot = Read-AudioJsonSnapshot -Path $backupFile -ExpectedSha256 $ExpectedSha256 -Context 'Audio backup'
+    $json = $snapshot.Json
     $raw = ConvertFrom-AudioJsonDocument -Json $json
     Assert-AudioRawBackupContract -Raw $raw
     $json | ConvertFrom-Json
@@ -1119,12 +1142,11 @@ function Get-AudioBackupDifferences {
     }
 
     $priorityFlows = @($Backup.priorityFlows)
-    if ($priorityFlows.Count -eq 0 -and [bool](Get-AudioObjectProperty -Object $Backup -Name 'priorityIncluded')) { $priorityFlows = @('render','capture') }
     $priorityEndpointsValue = Get-AudioObjectProperty -Object $Backup -Name 'priorityEndpoints'
     $priorityEndpointIds = if ($null -eq $priorityEndpointsValue) { @() } else { @($priorityEndpointsValue | ForEach-Object { "$($_.flow)/$($_.endpointId)" }) }
     foreach ($device in @($Backup.devices | Where-Object {
         $identity = "$($_.flow)/$($_.endpointId)"
-        $priorityFlows -contains $_.flow -and ($priorityEndpointIds.Count -eq 0 -or $priorityEndpointIds -contains $identity)
+        $priorityFlows -contains $_.flow -and $priorityEndpointIds -contains $identity
     })) {
         $endpoint = @($Inventory | Where-Object { $_.Flow -eq $device.flow -and $_.EndpointId -eq $device.endpointId })[0]
         if ($null -eq $endpoint) { continue }

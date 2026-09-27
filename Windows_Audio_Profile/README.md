@@ -86,7 +86,7 @@ Before changing anything, `Apply` verifies that every touched property can be ba
 - Fixed-volume virtual endpoints can report a `0 dB..0 dB` range. Their percentage control is not meaningful.
 - Per-channel levels, Microphone Boost, driver-specific effects, PnP state, driver installation, and Bluetooth pairing are outside version 1.
 - Sound control panels can cache names and icons until reopened.
-- Version 1 is a portable script utility, not a signed installer. Protected staging prevents modification after elevation begins, but the utility does not authenticate source scripts before launch. Keep the checkout in a trusted location and review updates before approving UAC.
+- Version 1 is a portable script utility, not a signed installer. Protected staging prevents modification after code enters that staging directory, but the utility does not authenticate source scripts before launch or copy. Keep the checkout in a trusted location and review updates before approving UAC.
 
 ## Tests
 

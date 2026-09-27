@@ -11,6 +11,7 @@ $originalProfilePath = Join-Path $testRoot 'original.json'
 $changedProfilePath = Join-Path $testRoot 'changed.json'
 $backupPath = $null
 $applied = $false
+$baselineCaptured = $false
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -91,6 +92,7 @@ try {
 
     $export = Invoke-JsonScript -Script (Join-Path $utilityRoot 'Export-AudioProfile.ps1') -Arguments @('-OutputPath', $originalProfilePath, '-Json')
     Assert-True ($export.ExitCode -eq 0) 'Initial profile export failed.'
+    $baselineCaptured = $true
     $original = Get-Content -Raw -LiteralPath $originalProfilePath | ConvertFrom-Json
 
     $activeEndpoints = @($inventoryForPlan | Where-Object { $_.Active })
@@ -109,12 +111,12 @@ try {
         )
     }
     [IO.File]::WriteAllText($strictFailurePath, ($strictFailureProfile | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+    $backupPath = $null
+    $applied = $true
     $strictFailure = Invoke-JsonScript -Script (Join-Path $utilityRoot 'Apply-AudioProfile.ps1') -Arguments @('-ProfilePath', $strictFailurePath, '-ApplyMode', 'Strict', '-BackupRoot', $backupRoot, '-Json')
     $strictFailureReport = $strictFailure.Output | ConvertFrom-Json
-    if (-not [string]::IsNullOrWhiteSpace([string]$strictFailureReport.backup) -and -not [bool]$strictFailureReport.rolledBack) {
-        $backupPath = [string]$strictFailureReport.backup
-        $applied = $true
-    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$strictFailureReport.backup)) { $backupPath = [string]$strictFailureReport.backup }
+    if ([bool]$strictFailureReport.rolledBack) { $applied = $false }
     Assert-True ($strictFailure.ExitCode -eq 1 -and $strictFailureReport.rolledBack -eq $true) "Strict failure must rollback before returning: $($strictFailure.Error) $($strictFailure.Output)"
     Assert-True ((Get-ProfileDifferenceCount -Path $originalProfilePath) -eq 0) 'Strict rollback did not restore the original audio state.'
 
@@ -136,6 +138,8 @@ try {
     }
     [IO.File]::WriteAllText($changedProfilePath, ($changed | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
 
+    $backupPath = $null
+    $applied = $true
     $apply = Invoke-JsonScript -Script (Join-Path $utilityRoot 'Apply-AudioProfile.ps1') -Arguments @('-ProfilePath', $changedProfilePath, '-ApplyMode', 'Strict', '-BackupRoot', $backupRoot, '-Json')
     Assert-True ($apply.ExitCode -eq 0) "Strict priority apply failed: $($apply.Error) $($apply.Output)"
     $applyReport = $apply.Output | ConvertFrom-Json
@@ -156,6 +160,8 @@ try {
     $copyRoot = Join-Path $testRoot 'UtilityCopy'
     Copy-Item -LiteralPath $utilityRoot -Destination $copyRoot -Recurse
     Remove-Item -LiteralPath (Join-Path $copyRoot 'Set-AudioPriority.ps1') -Force
+    $backupPath = $null
+    $applied = $true
     $bestEffort = Invoke-JsonScript -Script (Join-Path $copyRoot 'Apply-AudioProfile.ps1') -Arguments @('-ProfilePath', $changedProfilePath, '-ApplyMode', 'BestEffort', '-BackupRoot', $backupRoot, '-Json')
     if (-not [string]::IsNullOrWhiteSpace($bestEffort.Output)) {
         $bestEffortReport = $bestEffort.Output | ConvertFrom-Json
@@ -177,10 +183,22 @@ try {
     Write-Output 'PASS: elevated priority apply, verification, and undo'
 }
 catch {
+    if ($baselineCaptured) {
+        try { if ((Get-ProfileDifferenceCount -Path $originalProfilePath) -eq 0) { $applied = $false } } catch { }
+    }
     if ($applied) {
-        $recovery = Invoke-JsonScript -Script (Join-Path $utilityRoot 'Undo-AudioProfile.ps1') -Arguments @('-BackupPath', $backupPath, '-Json')
-        if ($recovery.ExitCode -ne 0) { Write-Error "The test changed priority and emergency Undo failed. Preserve and use backup: $backupPath" }
-        else { $applied = $false }
+        if ([string]::IsNullOrWhiteSpace($backupPath)) {
+            $candidates = @(Get-ChildItem -LiteralPath $backupRoot -Directory -ErrorAction SilentlyContinue | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'state.json') } | Sort-Object LastWriteTimeUtc -Descending)
+            $candidate = if ($candidates.Count -gt 0) { $candidates[0] } else { $null }
+            if ($null -ne $candidate) { $backupPath = $candidate.FullName }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($backupPath)) {
+            $recovery = Invoke-JsonScript -Script (Join-Path $utilityRoot 'Undo-AudioProfile.ps1') -Arguments @('-BackupPath', $backupPath, '-Json')
+            if ($recovery.ExitCode -eq 0) {
+                try { if (-not $baselineCaptured -or (Get-ProfileDifferenceCount -Path $originalProfilePath) -eq 0) { $applied = $false } } catch { }
+            }
+        }
+        if ($applied) { Write-Error "The test may have changed audio state and automatic recovery failed. Preserve test data and use backup: $backupPath" }
     }
     if (-not $applied -and (Test-Path -LiteralPath $testRoot)) { Remove-Item -LiteralPath $testRoot -Recurse -Force }
     throw

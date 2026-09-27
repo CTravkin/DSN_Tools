@@ -119,6 +119,19 @@ function New-ValidBackup {
     }
 }
 
+function New-ValidPriorityBackup {
+    $backup = New-ValidBackup
+    $backup.priorityIncluded = $true
+    $backup.priorityFlows = @('render')
+    $backup.priorityEndpoints = @(@{ flow='render'; endpointId='{11111111-1111-1111-1111-111111111111}' })
+    $backup.defaults = @(
+        @{ flow='render'; role='console'; endpointId='{0.0.0.00000000}.{11111111-1111-1111-1111-111111111111}' },
+        @{ flow='render'; role='multimedia'; endpointId='{0.0.0.00000000}.{11111111-1111-1111-1111-111111111111}' },
+        @{ flow='render'; role='communications'; endpointId='{0.0.0.00000000}.{11111111-1111-1111-1111-111111111111}' }
+    )
+    $backup
+}
+
 try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null
     Import-Module $modulePath -Force
@@ -153,6 +166,11 @@ try {
     $invalidBinding.target = @{ binding = 'loose' }
     $invalidBindingPath = Write-TestProfile -Document $invalidBinding
     Assert-Throws { Import-AudioProfile -Path $invalidBindingPath } 'target.binding' 'Machine binding must reject unsupported modes.'
+
+    $missingStrictHash = New-ValidProfile
+    $missingStrictHash.target = @{ binding = 'strict' }
+    $missingStrictHashPath = Write-TestProfile -Document $missingStrictHash
+    Assert-Throws { Import-AudioProfile -Path $missingStrictHashPath } 'machineIdSha256.*required' 'Strict machine binding must require an explicit machine hash.'
 
     $invalidFormat = New-ValidProfile
     $invalidFormat.devices[0].settings.format.sampleRateHz = 0
@@ -217,6 +235,19 @@ try {
     $scalarTouchedPath = Write-TestProfile -Document $scalarTouched
     Assert-Throws { Import-AudioBackup -Path $scalarTouchedPath } 'touched.*array' 'Backup touched must remain a JSON array.'
     Assert-Throws { Import-AudioBackup -Path $validBackupPath -ExpectedSha256 ('0' * 64) } 'hash verification failed' 'Undo input must be bound to the pre-elevation backup hash.'
+    $emptyPriorityEndpoints = New-ValidPriorityBackup
+    $emptyPriorityEndpoints.priorityEndpoints = @()
+    $emptyPriorityEndpointsPath = Write-TestProfile -Document $emptyPriorityEndpoints
+    Assert-Throws { Import-AudioBackup -Path $emptyPriorityEndpointsPath } 'priorityEndpoints.*not be empty' 'Priority restore scope must never fall back from an empty endpoint list to every device.'
+    $orphanPriorityEndpoint = New-ValidPriorityBackup
+    $orphanPriorityEndpoint.priorityEndpoints[0].endpointId = '{22222222-2222-2222-2222-222222222222}'
+    foreach ($default in $orphanPriorityEndpoint.defaults) { $default.endpointId = '{0.0.0.00000000}.{22222222-2222-2222-2222-222222222222}' }
+    $orphanPriorityEndpointPath = Write-TestProfile -Document $orphanPriorityEndpoint
+    Assert-Throws { Import-AudioBackup -Path $orphanPriorityEndpointPath } 'no matching device snapshot' 'Every priority endpoint must have one exact device snapshot.'
+    $crossFlowDefault = New-ValidPriorityBackup
+    $crossFlowDefault.defaults[0].endpointId = '{0.0.1.00000000}.{11111111-1111-1111-1111-111111111111}'
+    $crossFlowDefaultPath = Write-TestProfile -Document $crossFlowDefault
+    Assert-Throws { Import-AudioBackup -Path $crossFlowDefaultPath } 'for its flow' 'A default endpoint ID must encode the declared flow.'
 
     $inventory = @(
         [pscustomobject]@{
@@ -363,7 +394,8 @@ try {
     Initialize-AudioInterop -SourcePath (Join-Path $utilityRoot 'CoreAudio.cs')
     $tokenRunnerParameters = [DSNTools.WindowsAudioProfile.TokenRunner].GetMethod('RunFromProcessToken').GetParameters()
     Assert-True ($tokenRunnerParameters.Count -eq 5 -and $tokenRunnerParameters[4].Name -eq 'timeoutMilliseconds') 'TrustedInstaller child execution must have an explicit finite timeout.'
-    $activeEndpoint = @($liveInventory | Where-Object { $_.Active })[0]
+    $activeEndpoints = @($liveInventory | Where-Object { $_.Active })
+    $activeEndpoint = if ($activeEndpoints.Count -gt 0) { $activeEndpoints[0] } else { $null }
     $liveVolume = $null
     if ($null -ne $activeEndpoint) {
         $liveVolume = Get-WindowsAudioEndpointVolume -Endpoint $activeEndpoint
@@ -408,7 +440,23 @@ try {
     $freshProfile = Import-AudioProfile -Path $exportedProfilePath
     $freshInventory = @(Get-WindowsAudioInventory)
     $freshResolved = Resolve-AudioProfileDevices -Profile $freshProfile -Inventory $freshInventory
-    $backupDocument = New-AudioBackupDocument -Profile $freshProfile -ResolvedDevices $freshResolved -Inventory $freshInventory
+    $freshPriorityFlows = @(@('render','capture') | Where-Object { $null -ne $freshProfile.priority.PSObject.Properties[$_] })
+    $canSnapshotLiveDefaults = $true
+    foreach ($flow in $freshPriorityFlows) {
+        foreach ($role in @('console','multimedia','communications')) {
+            try { $defaultId = Get-WindowsAudioDefaultEndpoint -Flow $flow -Role $role }
+            catch { $defaultId = $null }
+            if ([string]::IsNullOrWhiteSpace([string]$defaultId)) { $canSnapshotLiveDefaults = $false }
+        }
+    }
+    if ($canSnapshotLiveDefaults) {
+        $backupDocument = New-AudioBackupDocument -Profile $freshProfile -ResolvedDevices $freshResolved -Inventory $freshInventory
+    }
+    else {
+        $backupProfileWithoutPriority = Import-AudioProfile -Path $exportedProfilePath
+        [void]$backupProfileWithoutPriority.PSObject.Properties.Remove('priority')
+        $backupDocument = New-AudioBackupDocument -Profile $backupProfileWithoutPriority -ResolvedDevices $freshResolved -Inventory $freshInventory
+    }
     Assert-True ($backupDocument.version -eq 1) 'Audio backup format must be versioned.'
     Assert-True (@($backupDocument.devices).Count -eq $liveInventory.Count) 'Audio backup must capture every matched endpoint.'
     Assert-True (@($backupDocument.defaults).Count -eq (3 * @($backupDocument.priorityFlows).Count)) 'Audio backup must capture three defaults for every requested priority flow.'
@@ -429,15 +477,17 @@ try {
         Assert-True (@($muteOnlyBackup.defaults).Count -eq 0) 'A profile without priority must not snapshot defaults.'
     }
 
-    $singleFlowProfile = Import-AudioProfile -Path $exportedProfilePath
-    $singleFlow = @(@('render','capture') | Where-Object { $null -ne $singleFlowProfile.priority.PSObject.Properties[$_] })[0]
-    foreach ($otherFlow in @(@('render','capture') | Where-Object { $_ -ne $singleFlow })) { [void]$singleFlowProfile.priority.PSObject.Properties.Remove($otherFlow) }
-    $singleFlowResolved = Resolve-AudioProfileDevices -Profile $singleFlowProfile -Inventory $freshInventory
-    $singleFlowBackup = New-AudioBackupDocument -Profile $singleFlowProfile -ResolvedDevices $singleFlowResolved -Inventory $freshInventory
-    Assert-True (@($singleFlowBackup.priorityFlows).Count -eq 1 -and $singleFlowBackup.priorityFlows[0] -eq $singleFlow) 'Backup must record only the priority flow requested by the profile.'
-    Assert-True (@($singleFlowBackup.defaults).Count -eq 3) 'A single-flow priority patch must snapshot only three defaults.'
-    $expectedSingleFlowPriorityEndpoints = @($freshInventory | Where-Object { $_.Flow -eq $singleFlow -and -not $_.NeverSetAsDefault }).Count
-    Assert-True (@($singleFlowBackup.priorityEndpoints).Count -eq $expectedSingleFlowPriorityEndpoints) 'Backup must record exactly the endpoints whose priority Apply can touch.'
+    if ($canSnapshotLiveDefaults -and $freshPriorityFlows.Count -gt 0) {
+        $singleFlowProfile = Import-AudioProfile -Path $exportedProfilePath
+        $singleFlow = $freshPriorityFlows[0]
+        foreach ($otherFlow in @(@('render','capture') | Where-Object { $_ -ne $singleFlow })) { [void]$singleFlowProfile.priority.PSObject.Properties.Remove($otherFlow) }
+        $singleFlowResolved = Resolve-AudioProfileDevices -Profile $singleFlowProfile -Inventory $freshInventory
+        $singleFlowBackup = New-AudioBackupDocument -Profile $singleFlowProfile -ResolvedDevices $singleFlowResolved -Inventory $freshInventory
+        Assert-True (@($singleFlowBackup.priorityFlows).Count -eq 1 -and $singleFlowBackup.priorityFlows[0] -eq $singleFlow) 'Backup must record only the priority flow requested by the profile.'
+        Assert-True (@($singleFlowBackup.defaults).Count -eq 3) 'A single-flow priority patch must snapshot only three defaults.'
+        $expectedSingleFlowPriorityEndpoints = @($freshInventory | Where-Object { $_.Flow -eq $singleFlow -and -not $_.NeverSetAsDefault }).Count
+        Assert-True (@($singleFlowBackup.priorityEndpoints).Count -eq $expectedSingleFlowPriorityEndpoints) 'Backup must record exactly the endpoints whose priority Apply can touch.'
+    }
 
     if ($null -ne $activeEndpoint) {
         $changedBackupEndpoint = [pscustomobject]@{
@@ -460,20 +510,32 @@ try {
     Assert-True ($differences.Count -eq 0) "A freshly exported profile must match current state; got $($differences.Count) difference(s)."
 
     $priorityAssignments = @(Get-AudioPriorityAssignments -Profile $freshProfile -ResolvedDevices $freshResolved -Inventory $freshInventory)
+    $planAssignments = if ($priorityAssignments.Count -gt 0) {
+        @($priorityAssignments | ForEach-Object { [ordered]@{ flow=$_.Flow; endpointId=$_.EndpointId; roleIndex=$_.RoleIndex; hasValue=$true; level=$_.Level } })
+    }
+    else {
+        $endpoint = $freshInventory[0]
+        $level = $endpoint.Levels.console
+        @([ordered]@{ flow=$endpoint.Flow; endpointId=$endpoint.EndpointId; roleIndex=0; hasValue=($null -ne $level); level=$level })
+    }
     $priorityPlanPath = Join-Path $testRoot 'priority-plan.json'
     $priorityPlan = [ordered]@{
         version = 1
         machineIdSha256 = Get-AudioMachineHash
-        assignments = @($priorityAssignments | ForEach-Object {
-            [ordered]@{ flow=$_.Flow; endpointId=$_.EndpointId; roleIndex=$_.RoleIndex; level=$_.Level }
-        })
+        assignments = @($planAssignments)
     }
     [IO.File]::WriteAllText($priorityPlanPath, ($priorityPlan | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
     $priorityWorker = Join-Path $utilityRoot 'Set-AudioPriority.ps1'
     $priorityValidation = Invoke-JsonScript -Script $priorityWorker -Arguments @('-Mode', 'Validate', '-PlanPath', $priorityPlanPath, '-Json')
     Assert-True ($priorityValidation.ExitCode -eq 0) "Priority worker must accept a valid plan: $($priorityValidation.Error)"
     $priorityValidationReport = $priorityValidation.Output | ConvertFrom-Json
-    Assert-True ($priorityValidationReport.assignments -eq $priorityAssignments.Count) 'Priority worker validation must retain every assignment.'
+    Assert-True ($priorityValidationReport.assignments -eq $planAssignments.Count) 'Priority worker validation must retain every assignment.'
+    $invalidPriorityPlan = Get-Content -Raw -LiteralPath $priorityPlanPath | ConvertFrom-Json
+    $invalidPriorityPlan.assignments[0].hasValue = 'false'
+    $invalidPriorityPlanPath = Join-Path $testRoot 'invalid-priority-plan.json'
+    [IO.File]::WriteAllText($invalidPriorityPlanPath, ($invalidPriorityPlan | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+    $invalidPriorityValidation = Invoke-JsonScript -Script $priorityWorker -Arguments @('-Mode', 'Validate', '-PlanPath', $invalidPriorityPlanPath, '-Json')
+    Assert-True ($invalidPriorityValidation.ExitCode -eq 1 -and $invalidPriorityValidation.Error -match 'hasValue.*Boolean') 'Priority plans must reject string booleans before privileged execution.'
 
     $testEndpointId = '{aaaaaaaa-1111-2222-3333-bbbbbbbbbbbb}'
     $registryOperations = @(Get-AudioPriorityRegistryOperations -AudioRoot 'HKLM:\Example\Audio' -Assignments @(

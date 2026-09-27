@@ -104,7 +104,6 @@ try {
     if ([bool]$backup.priorityIncluded) {
         try {
             $priorityFlows = @($backup.priorityFlows)
-            if ($priorityFlows.Count -eq 0) { $priorityFlows = @('render','capture') }
             $priorityEndpointsProperty = $backup.PSObject.Properties['priorityEndpoints']
             $priorityEndpointIds = if ($null -eq $priorityEndpointsProperty) { @() } else { @($priorityEndpointsProperty.Value | ForEach-Object { "$($_.flow)/$($_.endpointId)" }) }
             foreach ($default in @($backup.defaults | Where-Object { $priorityFlows -contains $_.flow })) {
@@ -114,7 +113,7 @@ try {
             $assignments = [Collections.Generic.List[object]]::new()
             foreach ($device in @($backup.devices | Where-Object {
                 $identity = "$($_.flow)/$($_.endpointId)"
-                $priorityFlows -contains $_.flow -and ($priorityEndpointIds.Count -eq 0 -or $priorityEndpointIds -contains $identity)
+                $priorityFlows -contains $_.flow -and $priorityEndpointIds -contains $identity
             })) {
                 for ($roleIndex = 0; $roleIndex -lt 3; $roleIndex++) {
                     $role = @('console', 'multimedia', 'communications')[$roleIndex]

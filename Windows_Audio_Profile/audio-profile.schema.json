@@ -20,6 +20,12 @@
     "target": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "binding": { "const": "strict" } }, "required": ["binding"] },
+          "then": { "required": ["machineIdSha256"] }
+        }
+      ],
       "properties": {
         "computerName": { "type": "string" },
         "machineIdSha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
@@ -54,7 +60,7 @@
           "required": ["flow"],
           "properties": {
             "flow": { "enum": ["render", "capture"] },
-            "endpointId": { "type": "string", "pattern": "^\\{[0-9a-fA-F-]{36}\\}$" },
+            "endpointId": { "type": "string", "pattern": "^\\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}$" },
             "containerId": { "type": "string" },
             "deviceInstanceId": { "type": "string" },
             "hardwareIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },

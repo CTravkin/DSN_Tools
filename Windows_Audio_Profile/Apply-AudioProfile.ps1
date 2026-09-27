@@ -68,6 +68,7 @@ function Invoke-ElevatedApply {
 }
 
 $backupPath = $null
+$backupSha256 = $null
 $errors = [Collections.Generic.List[object]]::new()
 $rolledBack = $false
 
@@ -111,7 +112,39 @@ try {
     New-Item -ItemType Directory -Path $backupPath | Out-Null
     $backupFile = Join-Path $backupPath 'state.json'
     $backup = New-AudioBackupDocument -Profile $profile -ResolvedDevices $resolved -Inventory $inventory
+    foreach ($backupDevice in @($backup.devices | Where-Object {
+        $touched = @($_.touched)
+        $null -eq $_.volume -and ($touched -contains 'volume' -or $touched -contains 'volume.level' -or $touched -contains 'volume.muted')
+    })) {
+        $endpoint = $resolved[[string]$backupDevice.key]
+        $originalDefaults = [Collections.Generic.List[object]]::new()
+        foreach ($role in @('console','multimedia','communications')) {
+            $originalDefaults.Add([pscustomobject]@{ role=$role; endpointId=(Get-WindowsAudioDefaultEndpoint -Flow $endpoint.Flow -Role $role) })
+        }
+        try {
+            Set-WindowsAudioEndpointVisibility -EndpointId $endpoint.FullEndpointId -Visible $true
+            Start-Sleep -Milliseconds 500
+            $activeCandidates = @(Get-WindowsAudioInventory | Where-Object { $_.Flow -eq $endpoint.Flow -and $_.EndpointId -eq $endpoint.EndpointId })
+            $activeEndpoint = if ($activeCandidates.Count -gt 0) { $activeCandidates[0] } else { $null }
+            if ($null -eq $activeEndpoint -or -not $activeEndpoint.Active) { throw "Device '$($backupDevice.key)' could not be activated for reversible volume backup." }
+            $backupDevice.volume = Get-WindowsAudioEndpointVolume -Endpoint $activeEndpoint
+        }
+        finally {
+            $cleanupErrors = [Collections.Generic.List[string]]::new()
+            try { Set-WindowsAudioEndpointVisibility -EndpointId $endpoint.FullEndpointId -Visible ([bool]$backupDevice.enabled) -ErrorAction Stop }
+            catch { $cleanupErrors.Add($_.Exception.Message) }
+            foreach ($default in $originalDefaults) {
+                if (-not [string]::IsNullOrWhiteSpace([string]$default.endpointId)) {
+                    try { Set-WindowsAudioDefaultEndpoint -EndpointId ([string]$default.endpointId) -Role ([string]$default.role) }
+                    catch { $cleanupErrors.Add($_.Exception.Message) }
+                }
+            }
+            if ($cleanupErrors.Count -gt 0) { throw "Volume-backup preflight cleanup failed: $($cleanupErrors -join '; ')" }
+        }
+    }
     [IO.File]::WriteAllText($backupFile, ($backup | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
+    $backupSha256 = (Get-FileHash -LiteralPath $backupFile -Algorithm SHA256).Hash
+    [void](Import-AudioBackup -Path $backupFile -ExpectedSha256 $backupSha256)
     $verifiedVolumeKeys = [Collections.Generic.List[string]]::new()
 
     foreach ($profileDevice in @($profile.devices)) {
@@ -130,10 +163,7 @@ try {
                 Start-Sleep -Milliseconds 500
                 $endpoint = @(Get-WindowsAudioInventory | Where-Object { $_.Flow -eq $endpoint.Flow -and $_.EndpointId -eq $endpoint.EndpointId })[0]
                 if (-not $endpoint.Active) { throw "Device '$key' could not be activated for volume configuration." }
-                if ($null -eq $backupDevice.volume) {
-                    $backupDevice.volume = Get-WindowsAudioEndpointVolume -Endpoint $endpoint
-                    [IO.File]::WriteAllText($backupFile, ($backup | ConvertTo-Json -Depth 12), [Text.UTF8Encoding]::new($false))
-                }
+                if ($null -eq $backupDevice.volume) { throw "Reversible volume backup is missing for '$key'." }
             }
 
             $propertyArguments = @{ Endpoint=$endpoint }
@@ -213,9 +243,7 @@ catch {
     $failure = $_.Exception.Message
     if ($ApplyMode -eq 'Strict' -and $null -ne $backupPath -and (Test-Path -LiteralPath (Join-Path $backupPath 'state.json'))) {
         try {
-            $rollbackBackupFile = Join-Path $backupPath 'state.json'
-            $rollbackBackupSha256 = (Get-FileHash -LiteralPath $rollbackBackupFile -Algorithm SHA256).Hash
-            & (Join-Path $PSScriptRoot 'Undo-AudioProfile.ps1') -BackupPath $backupPath -InternalElevated -ExpectedBackupSha256 $rollbackBackupSha256 -Json | Out-Null
+            & (Join-Path $PSScriptRoot 'Undo-AudioProfile.ps1') -BackupPath $backupPath -InternalElevated -ExpectedBackupSha256 $backupSha256 -Json | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Undo exited with code $LASTEXITCODE." }
             $rolledBack = $true
         }
