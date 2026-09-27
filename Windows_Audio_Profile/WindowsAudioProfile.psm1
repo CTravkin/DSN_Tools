@@ -1192,6 +1192,27 @@ function Get-AudioBackupDifferences {
     @($differences)
 }
 
+function Get-AudioPreferredDefaultEndpoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Assignments,
+        [Parameter(Mandatory)][object[]]$Inventory,
+        [Parameter(Mandatory)][ValidateSet('render','capture')][string]$Flow,
+        [Parameter(Mandatory)][ValidateSet('console','multimedia','communications')][string]$Role
+    )
+
+    foreach ($assignment in @($Assignments | Where-Object { $_.Flow -eq $Flow -and $_.Role -eq $Role } | Sort-Object Level -Descending)) {
+        $matches = @($Inventory | Where-Object {
+            $_.Flow -eq $Flow -and
+            $_.EndpointId -eq $assignment.EndpointId -and
+            $_.Active -and
+            $_.Enabled
+        })
+        if ($matches.Count -gt 0) { return $matches[0] }
+    }
+    $null
+}
+
 function Get-AudioProfileDifferences {
     [CmdletBinding()]
     param(
@@ -1273,17 +1294,12 @@ function Get-AudioProfileDifferences {
                 if (($expectedOrder -join "`n") -ne ($actualOrder -join "`n")) {
                     $differences.Add([pscustomobject]@{ device=$flow; property="priority.$role"; expected=$expectedOrder; actual=$actualOrder })
                 }
-                $preferredCandidates = @($assignments | Where-Object { $_.Flow -eq $flow -and $_.Role -eq $role } | Sort-Object Level -Descending | ForEach-Object {
-                    $assignment = $_
-                    $matches = @($Inventory | Where-Object { $_.Flow -eq $flow -and $_.EndpointId -eq $assignment.EndpointId -and $_.Active })
-                    if ($matches.Count -gt 0) { $matches[0] }
-                } | Where-Object { $null -ne $_ })
-                $preferredActive = if ($preferredCandidates.Count -gt 0) { $preferredCandidates[0] } else { $null }
-                if ($null -ne $preferredActive) {
+                $preferredEnabled = Get-AudioPreferredDefaultEndpoint -Assignments $assignments -Inventory $Inventory -Flow $flow -Role $role
+                if ($null -ne $preferredEnabled) {
                     $defaultKey = "$flow/$role"
                     $actualDefault = if ($null -ne $DefaultEndpoints -and $DefaultEndpoints.ContainsKey($defaultKey)) { $DefaultEndpoints[$defaultKey] } else { Get-WindowsAudioDefaultEndpoint -Flow $flow -Role $role }
-                    if (-not [string]::Equals([string]$preferredActive.FullEndpointId, [string]$actualDefault, [StringComparison]::OrdinalIgnoreCase)) {
-                        $differences.Add([pscustomobject]@{ device=$flow; property="default.$role"; expected=$preferredActive.FullEndpointId; actual=$actualDefault })
+                    if (-not [string]::Equals([string]$preferredEnabled.FullEndpointId, [string]$actualDefault, [StringComparison]::OrdinalIgnoreCase)) {
+                        $differences.Add([pscustomobject]@{ device=$flow; property="default.$role"; expected=$preferredEnabled.FullEndpointId; actual=$actualDefault })
                     }
                 }
             }
@@ -1492,4 +1508,4 @@ function Get-AudioPriorityAssignments {
     @($assignments)
 }
 
-Export-ModuleMember -Function Import-AudioProfile,Import-AudioBackup,Resolve-AudioProfileDevices,Get-AudioPriorityAssignments,ConvertFrom-AudioWaveFormat,ConvertTo-AudioWaveFormatBytes,Get-WindowsAudioInventory,Initialize-AudioInterop,Get-WindowsAudioEndpointVolume,Get-WindowsAudioDefaultEndpoint,Set-WindowsAudioEndpointVolume,Set-WindowsAudioDefaultEndpoint,Set-WindowsAudioEndpointVisibility,Set-WindowsAudioEndpointProperties,Get-AudioMachineHash,New-AudioProfileDocument,Get-AudioIconSourceFile,Test-AudioProfileState,New-AudioBackupDocument,Get-AudioBackupDeviceRestoreArguments,Get-AudioBackupDifferences,Get-AudioProfileDifferences,Get-AudioPriorityRegistryOperations,Set-AudioPriorityRegistryValues
+Export-ModuleMember -Function Import-AudioProfile,Import-AudioBackup,Resolve-AudioProfileDevices,Get-AudioPriorityAssignments,ConvertFrom-AudioWaveFormat,ConvertTo-AudioWaveFormatBytes,Get-WindowsAudioInventory,Initialize-AudioInterop,Get-WindowsAudioEndpointVolume,Get-WindowsAudioDefaultEndpoint,Get-AudioPreferredDefaultEndpoint,Set-WindowsAudioEndpointVolume,Set-WindowsAudioDefaultEndpoint,Set-WindowsAudioEndpointVisibility,Set-WindowsAudioEndpointProperties,Get-AudioMachineHash,New-AudioProfileDocument,Get-AudioIconSourceFile,Test-AudioProfileState,New-AudioBackupDocument,Get-AudioBackupDeviceRestoreArguments,Get-AudioBackupDifferences,Get-AudioProfileDifferences,Get-AudioPriorityRegistryOperations,Set-AudioPriorityRegistryValues

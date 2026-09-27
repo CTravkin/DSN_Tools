@@ -54,12 +54,7 @@ function Assert-EffectiveProfileDefaults {
     $assignments = @(Get-AudioPriorityAssignments -Profile $profile -ResolvedDevices $resolved -Inventory $inventory)
     foreach ($flow in @('render','capture')) {
         foreach ($role in @('console','multimedia','communications')) {
-            $preferredCandidates = @($assignments | Where-Object { $_.Flow -eq $flow -and $_.Role -eq $role } | Sort-Object Level -Descending | ForEach-Object {
-                $assignment = $_
-                $matches = @($inventory | Where-Object { $_.Flow -eq $flow -and $_.EndpointId -eq $assignment.EndpointId -and $_.Active })
-                if ($matches.Count -gt 0) { $matches[0] }
-            } | Where-Object { $null -ne $_ })
-            $preferred = if ($preferredCandidates.Count -gt 0) { $preferredCandidates[0] } else { $null }
+            $preferred = Get-AudioPreferredDefaultEndpoint -Assignments $assignments -Inventory $inventory -Flow $flow -Role $role
             if ($null -eq $preferred) { continue }
             $actual = Get-WindowsAudioDefaultEndpoint -Flow $flow -Role $role
             Assert-True ([string]::Equals([string]$preferred.FullEndpointId, [string]$actual, [StringComparison]::OrdinalIgnoreCase)) "Effective default mismatch for $flow/$role."

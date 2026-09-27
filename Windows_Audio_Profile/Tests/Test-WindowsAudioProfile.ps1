@@ -374,11 +374,11 @@ try {
     $priorityInventory = @(
         [pscustomobject]@{
             Flow='render'; EndpointId='{11111111-1111-1111-1111-111111111111}'; FullEndpointId='{0.0.0.00000000}.{11111111-1111-1111-1111-111111111111}'
-            Active=$true; NeverSetAsDefault=$false; Levels=[pscustomobject]@{ console=1000; multimedia=1000; communications=1001 }
+            Active=$true; Enabled=$true; NeverSetAsDefault=$false; Levels=[pscustomobject]@{ console=1000; multimedia=1000; communications=1001 }
         },
         [pscustomobject]@{
             Flow='render'; EndpointId='{99999999-9999-9999-9999-999999999999}'; FullEndpointId='{0.0.0.00000000}.{99999999-9999-9999-9999-999999999999}'
-            Active=$true; NeverSetAsDefault=$false; Levels=[pscustomobject]@{ console=1001; multimedia=1001; communications=1000 }
+            Active=$true; Enabled=$true; NeverSetAsDefault=$false; Levels=[pscustomobject]@{ console=1001; multimedia=1001; communications=1000 }
         }
     )
     $wrongDefaults = @{
@@ -390,6 +390,17 @@ try {
     Assert-True (@($defaultDifferences | Where-Object { $_.property -eq 'default.console' }).Count -eq 1) 'Profile comparison must detect an incorrect effective default endpoint even when priority levels match.'
     $wrongDefaults['render/console'] = $priorityInventory[1].FullEndpointId
     Assert-True (@(Get-AudioProfileDifferences -Profile $priorityOnlyProfile -ResolvedDevices $resolved -Inventory $priorityInventory -DefaultEndpoints $wrongDefaults).Count -eq 0) 'Profile comparison must accept matching priority levels and effective defaults.'
+
+    $priorityInventory[1].Enabled = $false
+    $preferredEnabled = Get-AudioPreferredDefaultEndpoint -Assignments $assignments -Inventory $priorityInventory -Flow render -Role console
+    Assert-True ($preferredEnabled.EndpointId -eq $priorityInventory[0].EndpointId) 'An active but disabled endpoint must not become the effective default candidate.'
+    $enabledDefaults = @{
+        'render/console'=$priorityInventory[0].FullEndpointId
+        'render/multimedia'=$priorityInventory[0].FullEndpointId
+        'render/communications'=$priorityInventory[0].FullEndpointId
+    }
+    Assert-True (@(Get-AudioProfileDifferences -Profile $priorityOnlyProfile -ResolvedDevices $resolved -Inventory $priorityInventory -DefaultEndpoints $enabledDefaults).Count -eq 0) 'Profile comparison must ignore disabled endpoints when checking effective defaults.'
+    $priorityInventory[1].Enabled = $true
 
     $incomplete = New-ValidProfile
     $incomplete.priority.render.allRoles.leastToMostPreferred = @('headphones')

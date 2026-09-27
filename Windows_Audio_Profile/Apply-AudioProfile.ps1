@@ -207,11 +207,8 @@ try {
             $currentInventory = @(Get-WindowsAudioInventory)
             foreach ($flow in @('render', 'capture')) {
                 foreach ($role in @('console', 'multimedia', 'communications')) {
-                    $ordered = @($priorities | Where-Object { $_.Flow -eq $flow -and $_.Role -eq $role } | Sort-Object Level -Descending)
-                    foreach ($assignment in $ordered) {
-                        $candidate = @($currentInventory | Where-Object { $_.Flow -eq $flow -and $_.EndpointId -eq $assignment.EndpointId })[0]
-                        if ($candidate.Active) { Set-WindowsAudioDefaultEndpoint -EndpointId $candidate.FullEndpointId -Role $role; break }
-                    }
+                    $candidate = Get-AudioPreferredDefaultEndpoint -Assignments $priorities -Inventory $currentInventory -Flow $flow -Role $role
+                    if ($null -ne $candidate) { Set-WindowsAudioDefaultEndpoint -EndpointId $candidate.FullEndpointId -Role $role }
                 }
             }
             $priorityPlan = [ordered]@{
