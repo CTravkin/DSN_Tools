@@ -123,9 +123,13 @@ try {
             }
             $plan = [ordered]@{ version=1; machineIdSha256=(Get-AudioMachineHash); assignments=@($assignments) }
             $planPath = Join-Path $backupDirectory 'undo-priority-plan.json'
-            [IO.File]::WriteAllText($planPath, ($plan | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+            $planBytes = [Text.UTF8Encoding]::new($false).GetBytes(($plan | ConvertTo-Json -Depth 6))
+            $planHasher = [Security.Cryptography.SHA256]::Create()
+            try { $planSha256 = ([BitConverter]::ToString($planHasher.ComputeHash($planBytes))).Replace('-','') }
+            finally { $planHasher.Dispose() }
+            [IO.File]::WriteAllBytes($planPath, $planBytes)
             try {
-                & (Join-Path $PSScriptRoot 'Set-AudioPriority.ps1') -Mode Controller -PlanPath $planPath -Json | Out-Null
+                & (Join-Path $PSScriptRoot 'Set-AudioPriority.ps1') -Mode Controller -PlanPath $planPath -PlanSha256 $planSha256 -Json | Out-Null
                 if ($LASTEXITCODE -ne 0) { throw "Priority restore worker exited with code $LASTEXITCODE." }
             }
             finally { Remove-Item -LiteralPath $planPath -Force -ErrorAction SilentlyContinue }

@@ -219,8 +219,12 @@ try {
                 assignments=@($priorities | ForEach-Object { [ordered]@{ flow=$_.Flow; endpointId=$_.EndpointId; roleIndex=$_.RoleIndex; hasValue=$true; level=$_.Level } })
             }
             $priorityPlanPath = Join-Path $backupPath 'priority-plan.json'
-            [IO.File]::WriteAllText($priorityPlanPath, ($priorityPlan | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
-            & (Join-Path $PSScriptRoot 'Set-AudioPriority.ps1') -Mode Controller -PlanPath $priorityPlanPath -Json | Out-Null
+            $priorityPlanBytes = [Text.UTF8Encoding]::new($false).GetBytes(($priorityPlan | ConvertTo-Json -Depth 6))
+            $priorityPlanHasher = [Security.Cryptography.SHA256]::Create()
+            try { $priorityPlanSha256 = ([BitConverter]::ToString($priorityPlanHasher.ComputeHash($priorityPlanBytes))).Replace('-','') }
+            finally { $priorityPlanHasher.Dispose() }
+            [IO.File]::WriteAllBytes($priorityPlanPath, $priorityPlanBytes)
+            & (Join-Path $PSScriptRoot 'Set-AudioPriority.ps1') -Mode Controller -PlanPath $priorityPlanPath -PlanSha256 $priorityPlanSha256 -Json | Out-Null
             if ($LASTEXITCODE -ne 0) { throw "Priority worker exited with code $LASTEXITCODE." }
         }
         catch {

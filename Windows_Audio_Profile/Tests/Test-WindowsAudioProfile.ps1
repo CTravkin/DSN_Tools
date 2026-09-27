@@ -526,7 +526,8 @@ try {
     }
     [IO.File]::WriteAllText($priorityPlanPath, ($priorityPlan | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
     $priorityWorker = Join-Path $utilityRoot 'Set-AudioPriority.ps1'
-    $priorityValidation = Invoke-JsonScript -Script $priorityWorker -Arguments @('-Mode', 'Validate', '-PlanPath', $priorityPlanPath, '-Json')
+    $priorityPlanSha256 = (Get-FileHash -LiteralPath $priorityPlanPath -Algorithm SHA256).Hash
+    $priorityValidation = Invoke-JsonScript -Script $priorityWorker -Arguments @('-Mode', 'Validate', '-PlanPath', $priorityPlanPath, '-PlanSha256', $priorityPlanSha256, '-Json')
     Assert-True ($priorityValidation.ExitCode -eq 0) "Priority worker must accept a valid plan: $($priorityValidation.Error)"
     $priorityValidationReport = $priorityValidation.Output | ConvertFrom-Json
     Assert-True ($priorityValidationReport.assignments -eq $planAssignments.Count) 'Priority worker validation must retain every assignment.'
