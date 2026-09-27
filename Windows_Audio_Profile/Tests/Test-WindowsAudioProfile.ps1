@@ -464,8 +464,12 @@ try {
     }
 
     Initialize-AudioInterop -SourcePath (Join-Path $utilityRoot 'CoreAudio.cs')
-    $directStableId = [DSNTools.WindowsAudioProfile.CoreAudio]::GetStableId($firstLiveEndpoint.FullEndpointId)
-    Assert-True ([string]::Equals([string]$directStableId, [string]$firstLiveEndpoint.StableId, [StringComparison]::Ordinal)) 'Inventory StableId must round-trip through the Core Audio property store.'
+    $resolvedOrdinaryId = [DSNTools.WindowsAudioProfile.CoreAudio]::ResolveEndpointId($firstLiveEndpoint.FullEndpointId)
+    Assert-True ([string]::Equals([string]$resolvedOrdinaryId, [string]$firstLiveEndpoint.FullEndpointId, [StringComparison]::Ordinal)) 'The Core Audio resolver must return the ordinary endpoint ID.'
+    foreach ($endpoint in $liveStableIds) {
+        $resolvedStableId = [DSNTools.WindowsAudioProfile.CoreAudio]::ResolveEndpointId($endpoint.StableId)
+        Assert-True ([string]::Equals([string]$resolvedStableId, [string]$endpoint.FullEndpointId, [StringComparison]::Ordinal)) 'Every available StableId must resolve through IMMDeviceEnumerator.GetDevice to its ordinary endpoint ID.'
+    }
     $missingStableId = [DSNTools.WindowsAudioProfile.CoreAudio]::GetStableId('{0.0.0.00000000}.{00000000-0000-0000-0000-000000000000}')
     Assert-True ($null -eq $missingStableId) 'A missing endpoint must return no StableId without hiding Core Audio initialization failures.'
     $tokenRunnerParameters = [DSNTools.WindowsAudioProfile.TokenRunner].GetMethod('RunFromProcessToken').GetParameters()

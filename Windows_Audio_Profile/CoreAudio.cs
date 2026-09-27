@@ -305,14 +305,36 @@ namespace DSNTools.WindowsAudioProfile
                 int getValueResult = properties.GetValue(ref key, out value);
                 if (getValueResult == ElementNotFound) return null;
                 Check(getValueResult, "IPropertyStore.GetValue");
-                if (value.VariantType == 0 || value.PointerValue == IntPtr.Zero) return null;
+                if (value.VariantType == 0) return null;
                 if (value.VariantType != 31) throw new InvalidOperationException("PKEY_AudioEndpoint_StableId returned an unexpected property type.");
+                if (value.PointerValue == IntPtr.Zero) throw new InvalidOperationException("PKEY_AudioEndpoint_StableId returned a null string pointer.");
                 return Marshal.PtrToStringUni(value.PointerValue);
             }
             finally
             {
                 PropVariantClear(ref value);
                 if (properties != null) Marshal.FinalReleaseComObject(properties);
+                if (device != null) Marshal.FinalReleaseComObject(device);
+                if (enumerator != null) Marshal.FinalReleaseComObject(enumerator);
+            }
+        }
+
+        public static string ResolveEndpointId(string deviceId)
+        {
+            IMMDeviceEnumerator enumerator = null;
+            IMMDevice device = null;
+            try
+            {
+                enumerator = CreateEnumerator();
+                int getDeviceResult = enumerator.GetDevice(deviceId, out device);
+                if (getDeviceResult == ElementNotFound) return null;
+                Check(getDeviceResult, "IMMDeviceEnumerator.GetDevice");
+                string endpointId;
+                Check(device.GetId(out endpointId), "IMMDevice.GetId");
+                return endpointId;
+            }
+            finally
+            {
                 if (device != null) Marshal.FinalReleaseComObject(device);
                 if (enumerator != null) Marshal.FinalReleaseComObject(enumerator);
             }
