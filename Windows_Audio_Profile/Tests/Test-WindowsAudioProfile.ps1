@@ -147,6 +147,8 @@ try {
     Assert-True (& $module { Test-AudioEndpointVisibleState -DeviceState 8 }) 'An unplugged endpoint without the visibility bit must remain enabled.'
     Assert-True (-not (& $module { Test-AudioEndpointVisibleState -DeviceState 268435457 })) 'An active endpoint with the Windows hidden bit must be disabled.'
     Assert-True (-not (& $module { Test-AudioEndpointVisibleState -DeviceState 268435464 })) 'An unplugged endpoint with the Windows hidden bit must be disabled.'
+    Assert-True (-not (& $module { Test-AudioVolumeLevelChangeRequired -Expected 0 -Actual 0 })) 'An unchanged volume level must not be written to the audio driver again.'
+    Assert-True (& $module { Test-AudioVolumeLevelChangeRequired -Expected 20 -Actual 18 }) 'A materially different volume level must still be written.'
 
     $schema = Get-Content -Raw -LiteralPath (Join-Path $utilityRoot 'audio-profile.schema.json') | ConvertFrom-Json
     $stableIdPattern = [string]$schema.'$defs'.device.properties.match.properties.stableId.pattern

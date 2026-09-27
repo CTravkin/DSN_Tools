@@ -254,6 +254,15 @@ function Get-WindowsAudioDefaultEndpoint {
     [DSNTools.WindowsAudioProfile.CoreAudio]::GetDefaultEndpoint($flowIndex, $roleIndex)
 }
 
+function Test-AudioVolumeLevelChangeRequired {
+    param(
+        [Parameter(Mandatory)][double]$Expected,
+        [Parameter(Mandatory)][double]$Actual
+    )
+
+    [Math]::Abs($Expected - $Actual) -gt 0.11
+}
+
 function Set-WindowsAudioEndpointVolume {
     [CmdletBinding()]
     param(
@@ -265,14 +274,19 @@ function Set-WindowsAudioEndpointVolume {
 
     Initialize-AudioInterop
     if ($null -ne $Percent -and $null -ne $Decibels) { throw 'Specify either Percent or Decibels, not both.' }
+    $current = if ($null -ne $Percent -or $null -ne $Decibels -or $null -ne $Muted) { Get-WindowsAudioEndpointVolume -Endpoint $Endpoint } else { $null }
     if ($null -ne $Percent) {
         if ($Percent -lt 0 -or $Percent -gt 100) { throw 'Percent must be between 0 and 100.' }
-        [DSNTools.WindowsAudioProfile.CoreAudio]::SetVolumeScalar([string]$Endpoint.FullEndpointId, [single]($Percent / 100.0))
+        if (Test-AudioVolumeLevelChangeRequired -Expected $Percent -Actual $current.percent) {
+            [DSNTools.WindowsAudioProfile.CoreAudio]::SetVolumeScalar([string]$Endpoint.FullEndpointId, [single]($Percent / 100.0))
+        }
     }
     elseif ($null -ne $Decibels) {
-        [DSNTools.WindowsAudioProfile.CoreAudio]::SetVolumeDecibels([string]$Endpoint.FullEndpointId, [single]$Decibels)
+        if (Test-AudioVolumeLevelChangeRequired -Expected $Decibels -Actual $current.decibels) {
+            [DSNTools.WindowsAudioProfile.CoreAudio]::SetVolumeDecibels([string]$Endpoint.FullEndpointId, [single]$Decibels)
+        }
     }
-    if ($null -ne $Muted) {
+    if ($null -ne $Muted -and [bool]$Muted -ne [bool]$current.muted) {
         [DSNTools.WindowsAudioProfile.CoreAudio]::SetMute([string]$Endpoint.FullEndpointId, [bool]$Muted)
     }
 }
