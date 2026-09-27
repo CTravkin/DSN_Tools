@@ -160,6 +160,8 @@ namespace DSNTools.WindowsAudioProfile
 
     public static class CoreAudio
     {
+        private const int ElementNotFound = unchecked((int)0x80070490);
+
         [DllImport("ole32.dll")]
         private static extern int PropVariantClear(ref PropVariant value);
 
@@ -291,14 +293,20 @@ namespace DSNTools.WindowsAudioProfile
             try
             {
                 enumerator = CreateEnumerator();
-                Check(enumerator.GetDevice(endpointId, out device), "IMMDeviceEnumerator.GetDevice");
-                if (device.OpenPropertyStore(0, out properties) < 0) return null;
+                int getDeviceResult = enumerator.GetDevice(endpointId, out device);
+                if (getDeviceResult == ElementNotFound) return null;
+                Check(getDeviceResult, "IMMDeviceEnumerator.GetDevice");
+                Check(device.OpenPropertyStore(0, out properties), "IMMDevice.OpenPropertyStore");
                 PropertyKey key = new PropertyKey
                 {
                     FormatId = new Guid("1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E"),
                     PropertyId = 12
                 };
-                if (properties.GetValue(ref key, out value) < 0 || value.VariantType != 31 || value.PointerValue == IntPtr.Zero) return null;
+                int getValueResult = properties.GetValue(ref key, out value);
+                if (getValueResult == ElementNotFound) return null;
+                Check(getValueResult, "IPropertyStore.GetValue");
+                if (value.VariantType == 0 || value.PointerValue == IntPtr.Zero) return null;
+                if (value.VariantType != 31) throw new InvalidOperationException("PKEY_AudioEndpoint_StableId returned an unexpected property type.");
                 return Marshal.PtrToStringUni(value.PointerValue);
             }
             finally

@@ -61,7 +61,7 @@
           "properties": {
             "flow": { "enum": ["render", "capture"] },
             "endpointId": { "type": "string", "pattern": "^\\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\\}$" },
-            "stableId": { "type": "string", "minLength": 1 },
+            "stableId": { "type": "string", "minLength": 1, "pattern": "\\S" },
             "containerId": { "type": "string" },
             "deviceInstanceId": { "type": "string" },
             "hardwareIds": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },

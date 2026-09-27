@@ -142,6 +142,10 @@ try {
     Assert-True (@($profile.devices).Count -eq 2) 'A valid profile must retain both devices.'
     Assert-Throws { Import-AudioProfile -Path $validPath -ExpectedSha256 ('0' * 64) } 'hash verification failed' 'Apply input must be bound to the pre-elevation profile hash.'
 
+    $schema = Get-Content -Raw -LiteralPath (Join-Path $utilityRoot 'audio-profile.schema.json') | ConvertFrom-Json
+    $stableIdPattern = [string]$schema.'$defs'.device.properties.match.properties.stableId.pattern
+    Assert-True (-not [string]::IsNullOrWhiteSpace($stableIdPattern) -and -not ('   ' -match $stableIdPattern)) 'The JSON schema must reject whitespace-only StableId values.'
+
     $invalidVolume = New-ValidProfile
     $invalidVolume.devices[0].settings.volume = @{ percent = 50; decibels = -6.0 }
     $invalidVolumePath = Write-TestProfile -Document $invalidVolume
@@ -218,6 +222,11 @@ try {
     $emptyStableId.devices[0].match.stableId = ''
     $emptyStableIdPath = Write-TestProfile -Document $emptyStableId
     Assert-Throws { Import-AudioProfile -Path $emptyStableIdPath } 'stableId.*non-empty' 'Empty Stable IDs must be rejected during import.'
+
+    $whitespaceStableId = New-ValidProfile
+    $whitespaceStableId.devices[0].match.stableId = '   '
+    $whitespaceStableIdPath = Write-TestProfile -Document $whitespaceStableId
+    Assert-Throws { Import-AudioProfile -Path $whitespaceStableIdPath } 'stableId.*non-empty' 'Whitespace-only Stable IDs must be rejected during import.'
 
     $scalarHardwareIds = New-ValidProfile
     $scalarHardwareIds.devices[0].match.hardwareIds = 'USB\VID_0001&PID_0001'
@@ -455,6 +464,10 @@ try {
     }
 
     Initialize-AudioInterop -SourcePath (Join-Path $utilityRoot 'CoreAudio.cs')
+    $directStableId = [DSNTools.WindowsAudioProfile.CoreAudio]::GetStableId($firstLiveEndpoint.FullEndpointId)
+    Assert-True ([string]::Equals([string]$directStableId, [string]$firstLiveEndpoint.StableId, [StringComparison]::Ordinal)) 'Inventory StableId must round-trip through the Core Audio property store.'
+    $missingStableId = [DSNTools.WindowsAudioProfile.CoreAudio]::GetStableId('{0.0.0.00000000}.{00000000-0000-0000-0000-000000000000}')
+    Assert-True ($null -eq $missingStableId) 'A missing endpoint must return no StableId without hiding Core Audio initialization failures.'
     $tokenRunnerParameters = [DSNTools.WindowsAudioProfile.TokenRunner].GetMethod('RunFromProcessToken').GetParameters()
     Assert-True ($tokenRunnerParameters.Count -eq 5 -and $tokenRunnerParameters[4].Name -eq 'timeoutMilliseconds') 'TrustedInstaller child execution must have an explicit finite timeout.'
     $activeEndpoints = @($liveInventory | Where-Object { $_.Active })

@@ -174,7 +174,7 @@ function Get-WindowsAudioInventory {
             }
             $endpointId = $endpointKey.PSChildName
             $fullEndpointId = "{0.0.$fullIdFlow.00000000}.$endpointId"
-            $stableId = try { Get-WindowsAudioEndpointStableId -EndpointId $fullEndpointId } catch { $null }
+            $stableId = Get-WindowsAudioEndpointStableId -EndpointId $fullEndpointId
             $result.Add([pscustomobject][ordered]@{
                 Flow = $flow
                 EndpointId = $endpointId
