@@ -1,0 +1,78 @@
+{
+  "$schema": "./audio-profile.schema.json",
+  "schemaVersion": 1,
+  "profile": {
+    "name": "Example workstation"
+  },
+  "target": {
+    "computerName": "EXAMPLE-PC",
+    "machineIdSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "binding": "strict"
+  },
+  "devices": [
+    {
+      "key": "render-speakers",
+      "required": true,
+      "match": {
+        "flow": "render",
+        "endpointId": "{11111111-1111-1111-1111-111111111111}",
+        "containerId": "{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}",
+        "deviceInstanceId": "USB\\VID_0001&PID_0001\\EXAMPLE"
+      },
+      "settings": {
+        "name": "Speakers",
+        "icon": "%SystemRoot%\\System32\\mmres.dll,-3010",
+        "enabled": true,
+        "volume": {
+          "percent": 50,
+          "muted": false
+        },
+        "format": {
+          "channels": 2,
+          "sampleRateHz": 48000,
+          "bitsPerSample": 24,
+          "validBitsPerSample": 24,
+          "encoding": "pcm",
+          "channelMask": 3,
+          "extensible": true
+        }
+      }
+    },
+    {
+      "key": "render-headphones",
+      "required": false,
+      "match": {
+        "flow": "render",
+        "endpointId": "{22222222-2222-2222-2222-222222222222}",
+        "containerId": "{bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb}",
+        "deviceInstanceId": "BTHENUM\\DEV_001122334455\\EXAMPLE"
+      },
+      "settings": {
+        "name": "Headphones",
+        "enabled": true,
+        "volume": {
+          "decibels": 0,
+          "muted": false
+        }
+      }
+    }
+  ],
+  "priority": {
+    "render": {
+      "allRoles": {
+        "leastToMostPreferred": [
+          "render-speakers",
+          "render-headphones"
+        ]
+      },
+      "roles": {
+        "communications": {
+          "leastToMostPreferred": [
+            "render-headphones",
+            "render-speakers"
+          ]
+        }
+      }
+    }
+  }
+}

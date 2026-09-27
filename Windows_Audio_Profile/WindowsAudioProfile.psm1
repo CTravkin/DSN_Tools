@@ -1,0 +1,976 @@
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+
+function Get-AudioObjectProperty {
+    param(
+        [AllowNull()]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $Object) { return $null }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    $property.Value
+}
+
+function Get-AudioUInt16 {
+    param([byte[]]$Bytes, [int]$Offset)
+    [BitConverter]::ToUInt16($Bytes, $Offset)
+}
+
+function Get-AudioUInt32 {
+    param([byte[]]$Bytes, [int]$Offset)
+    [BitConverter]::ToUInt32($Bytes, $Offset)
+}
+
+function ConvertFrom-AudioWaveFormat {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][byte[]]$Bytes)
+
+    $offset = 0
+    if ($Bytes.Length -ge 48 -and (Get-AudioUInt16 -Bytes $Bytes -Offset 8) -in @(1, 3, 0xFFFE)) {
+        $offset = 8
+    }
+    if ($Bytes.Length -lt ($offset + 18)) { throw 'Audio format data is shorter than WAVEFORMATEX.' }
+
+    $formatTag = Get-AudioUInt16 -Bytes $Bytes -Offset $offset
+    $channels = Get-AudioUInt16 -Bytes $Bytes -Offset ($offset + 2)
+    $sampleRate = Get-AudioUInt32 -Bytes $Bytes -Offset ($offset + 4)
+    $bits = Get-AudioUInt16 -Bytes $Bytes -Offset ($offset + 14)
+    $extraSize = Get-AudioUInt16 -Bytes $Bytes -Offset ($offset + 16)
+    $validBits = $bits
+    $channelMask = 0
+    $encoding = switch ($formatTag) { 1 { 'pcm' } 3 { 'ieeeFloat' } default { 'unknown' } }
+    $subFormat = $null
+    $extensible = $formatTag -eq 0xFFFE
+    if ($extensible) {
+        if ($extraSize -lt 22 -or $Bytes.Length -lt ($offset + 40)) { throw 'WAVEFORMATEXTENSIBLE data is incomplete.' }
+        $validBits = Get-AudioUInt16 -Bytes $Bytes -Offset ($offset + 18)
+        $channelMask = Get-AudioUInt32 -Bytes $Bytes -Offset ($offset + 20)
+        $guidBytes = [byte[]]::new(16)
+        [Array]::Copy($Bytes, $offset + 24, $guidBytes, 0, 16)
+        $subFormat = [guid]::new($guidBytes)
+        if ($subFormat -eq [guid]'00000001-0000-0010-8000-00aa00389b71') { $encoding = 'pcm' }
+        elseif ($subFormat -eq [guid]'00000003-0000-0010-8000-00aa00389b71') { $encoding = 'ieeeFloat' }
+    }
+
+    [pscustomobject][ordered]@{
+        channels = [int]$channels
+        sampleRateHz = [int64]$sampleRate
+        bitsPerSample = [int]$bits
+        validBitsPerSample = [int]$validBits
+        encoding = $encoding
+        channelMask = [int64]$channelMask
+        extensible = $extensible
+    }
+}
+
+function ConvertTo-AudioWaveFormatBytes {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Format)
+
+    $channels = [int](Get-AudioObjectProperty -Object $Format -Name 'channels')
+    $sampleRate = [int64](Get-AudioObjectProperty -Object $Format -Name 'sampleRateHz')
+    $bits = [int](Get-AudioObjectProperty -Object $Format -Name 'bitsPerSample')
+    if ($channels -lt 1 -or $sampleRate -lt 1 -or $bits -lt 1) { throw 'Audio format requires positive channels, sampleRateHz, and bitsPerSample.' }
+    $validBitsValue = Get-AudioObjectProperty -Object $Format -Name 'validBitsPerSample'
+    $validBits = if ($null -eq $validBitsValue) { $bits } else { [int]$validBitsValue }
+    $encodingValue = Get-AudioObjectProperty -Object $Format -Name 'encoding'
+    $encoding = if ([string]::IsNullOrWhiteSpace([string]$encodingValue)) { 'pcm' } else { [string]$encodingValue }
+    $maskValue = Get-AudioObjectProperty -Object $Format -Name 'channelMask'
+    $channelMask = if ($null -ne $maskValue) { [uint32]$maskValue } elseif ($channels -eq 1) { [uint32]4 } elseif ($channels -eq 2) { [uint32]3 } else { [uint32]0 }
+    $subFormat = switch ($encoding) {
+        'pcm' { [guid]'00000001-0000-0010-8000-00aa00389b71' }
+        'ieeeFloat' { [guid]'00000003-0000-0010-8000-00aa00389b71' }
+        default { throw "Unsupported audio encoding '$encoding'." }
+    }
+    $bytesPerSample = [int][Math]::Ceiling($bits / 8.0)
+    $blockAlign = $channels * $bytesPerSample
+    $averageBytes = $sampleRate * $blockAlign
+    if ($blockAlign -gt [uint16]::MaxValue -or $averageBytes -gt [uint32]::MaxValue) { throw 'Audio format values are out of range.' }
+
+    $useExtensible = -not (Test-AudioObjectProperty -Object $Format -Name 'extensible') -or [bool]$Format.extensible
+    if (-not $useExtensible) {
+        $classicTag = if ($encoding -eq 'pcm') { [uint16]1 } else { [uint16]3 }
+        $classicBytes = [byte[]]::new(18)
+        [Array]::Copy([BitConverter]::GetBytes($classicTag), 0, $classicBytes, 0, 2)
+        [Array]::Copy([BitConverter]::GetBytes([uint16]$channels), 0, $classicBytes, 2, 2)
+        [Array]::Copy([BitConverter]::GetBytes([uint32]$sampleRate), 0, $classicBytes, 4, 4)
+        [Array]::Copy([BitConverter]::GetBytes([uint32]$averageBytes), 0, $classicBytes, 8, 4)
+        [Array]::Copy([BitConverter]::GetBytes([uint16]$blockAlign), 0, $classicBytes, 12, 2)
+        [Array]::Copy([BitConverter]::GetBytes([uint16]$bits), 0, $classicBytes, 14, 2)
+        [Array]::Copy([BitConverter]::GetBytes([uint16]0), 0, $classicBytes, 16, 2)
+        return $classicBytes
+    }
+
+    $bytes = [byte[]]::new(40)
+    [Array]::Copy([BitConverter]::GetBytes([uint16]0xFFFE), 0, $bytes, 0, 2)
+    [Array]::Copy([BitConverter]::GetBytes([uint16]$channels), 0, $bytes, 2, 2)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$sampleRate), 0, $bytes, 4, 4)
+    [Array]::Copy([BitConverter]::GetBytes([uint32]$averageBytes), 0, $bytes, 8, 4)
+    [Array]::Copy([BitConverter]::GetBytes([uint16]$blockAlign), 0, $bytes, 12, 2)
+    [Array]::Copy([BitConverter]::GetBytes([uint16]$bits), 0, $bytes, 14, 2)
+    [Array]::Copy([BitConverter]::GetBytes([uint16]22), 0, $bytes, 16, 2)
+    [Array]::Copy([BitConverter]::GetBytes([uint16]$validBits), 0, $bytes, 18, 2)
+    [Array]::Copy([BitConverter]::GetBytes($channelMask), 0, $bytes, 20, 4)
+    [Array]::Copy($subFormat.ToByteArray(), 0, $bytes, 24, 16)
+    $bytes
+}
+
+function Get-WindowsAudioInventory {
+    [CmdletBinding()]
+    param()
+
+    $audioRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio'
+    $propertyNames = @{
+        Name = '{a45c254e-df1c-4efd-8020-67d146a850e0},2'
+        EndpointName = '{b3f8fa53-0004-438e-9003-51a46e139bfc},6'
+        DeviceInstanceId = '{b3f8fa53-0004-438e-9003-51a46e139bfc},2'
+        ContainerId = '{9637b4b9-11ee-4c35-b43c-7b2452c993cc},1'
+        HardwareId = '{a8b865dd-2e3d-4094-ad97-e593a70c75d6},8'
+        HardwareIdSpecific = '{80f111c3-b103-42e1-afb6-db7a6fa8be1f},0'
+        DriverIdentity = '{83da6326-97a6-4088-9453-a1923f573b29},3'
+        Icon = '{259abffc-50a7-47ce-af08-68c9a7d73366},12'
+        Format = '{f19f064d-082c-4e27-bc73-6882a1bb8e4c},0'
+        NeverSet = '{f3e80bef-1723-4ff2-bcc4-7f83dc5e46d4},3'
+    }
+    $result = [Collections.Generic.List[object]]::new()
+    foreach ($flowDefinition in @(@('render', 'Render', '0'), @('capture', 'Capture', '1'))) {
+        $flow = $flowDefinition[0]
+        $registryFlow = $flowDefinition[1]
+        $fullIdFlow = $flowDefinition[2]
+        $flowPath = Join-Path $audioRoot $registryFlow
+        if (-not (Test-Path -LiteralPath $flowPath)) { continue }
+        foreach ($endpointKey in Get-ChildItem -LiteralPath $flowPath) {
+            $propertiesPath = Join-Path $endpointKey.PSPath 'Properties'
+            if (-not (Test-Path -LiteralPath $propertiesPath)) { continue }
+            $properties = Get-ItemProperty -LiteralPath $propertiesPath
+            $endpointValues = Get-ItemProperty -LiteralPath $endpointKey.PSPath
+            $readProperty = {
+                param([string]$Name)
+                $property = $properties.PSObject.Properties[$Name]
+                if ($null -eq $property) { return $null }
+                $property.Value
+            }
+            $hardwareIds = [Collections.Generic.List[string]]::new()
+            foreach ($hardwareProperty in @($propertyNames.HardwareId, $propertyNames.HardwareIdSpecific)) {
+                $value = & $readProperty $hardwareProperty
+                foreach ($item in @($value)) {
+                    if (-not [string]::IsNullOrWhiteSpace([string]$item) -and -not $hardwareIds.Contains([string]$item)) { $hardwareIds.Add([string]$item) }
+                }
+            }
+            $rawFormatBytes = & $readProperty $propertyNames.Format
+            $format = if ($null -ne $rawFormatBytes) {
+                try { ConvertFrom-AudioWaveFormat -Bytes ([byte[]]$rawFormatBytes) } catch { $null }
+            }
+            else { $null }
+            $neverSetValue = & $readProperty $propertyNames.NeverSet
+            $stateProperty = $endpointValues.PSObject.Properties['DeviceState']
+            $state = if ($null -eq $stateProperty) { 0 } else { [uint32]$stateProperty.Value }
+            $levels = [ordered]@{}
+            foreach ($roleIndex in 0..2) {
+                $levelProperty = $endpointValues.PSObject.Properties["Level:$roleIndex"]
+                $levels[@('console', 'multimedia', 'communications')[$roleIndex]] = if ($null -eq $levelProperty) { $null } else { [int64]$levelProperty.Value }
+            }
+            $endpointId = $endpointKey.PSChildName
+            $result.Add([pscustomobject][ordered]@{
+                Flow = $flow
+                EndpointId = $endpointId
+                FullEndpointId = "{0.0.$fullIdFlow.00000000}.$endpointId"
+                Name = [string](& $readProperty $propertyNames.Name)
+                EndpointName = [string](& $readProperty $propertyNames.EndpointName)
+                DeviceInstanceId = [string](& $readProperty $propertyNames.DeviceInstanceId)
+                ContainerId = [string](& $readProperty $propertyNames.ContainerId)
+                HardwareIds = @($hardwareIds)
+                DriverIdentity = [string](& $readProperty $propertyNames.DriverIdentity)
+                DriverProvider = $null
+                Icon = [string](& $readProperty $propertyNames.Icon)
+                Format = $format
+                DeviceState = $state
+                Enabled = -not [bool]($state -band 2)
+                Active = [bool]($state -band 1)
+                NeverSetAsDefault = $null -ne $neverSetValue -and [int64]$neverSetValue -ne 0
+                Levels = [pscustomobject]$levels
+                Volume = $null
+            })
+        }
+    }
+    @($result)
+}
+
+function Initialize-AudioInterop {
+    [CmdletBinding()]
+    param([string]$SourcePath = (Join-Path $PSScriptRoot 'CoreAudio.cs'))
+
+    if ('DSNTools.WindowsAudioProfile.CoreAudio' -as [type]) { return }
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) { throw "Core Audio source is missing: $SourcePath" }
+    Add-Type -Path $SourcePath
+}
+
+function Get-WindowsAudioEndpointVolume {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Endpoint)
+
+    Initialize-AudioInterop
+    $state = [DSNTools.WindowsAudioProfile.CoreAudio]::GetVolume([string]$Endpoint.FullEndpointId)
+    [pscustomobject][ordered]@{
+        percent = [Math]::Round([double]$state.Scalar * 100, 4)
+        decibels = [Math]::Round([double]$state.Decibels, 4)
+        minimumDecibels = [Math]::Round([double]$state.MinimumDecibels, 4)
+        maximumDecibels = [Math]::Round([double]$state.MaximumDecibels, 4)
+        incrementDecibels = [Math]::Round([double]$state.IncrementDecibels, 4)
+        muted = [bool]$state.Muted
+        fixed = [Math]::Abs([double]$state.MaximumDecibels - [double]$state.MinimumDecibels) -lt 0.0001
+    }
+}
+
+function Get-WindowsAudioDefaultEndpoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('render', 'capture')][string]$Flow,
+        [Parameter(Mandatory)][ValidateSet('console', 'multimedia', 'communications')][string]$Role
+    )
+
+    Initialize-AudioInterop
+    $flowIndex = if ($Flow -eq 'render') { 0 } else { 1 }
+    $roleIndex = @('console', 'multimedia', 'communications').IndexOf($Role)
+    [DSNTools.WindowsAudioProfile.CoreAudio]::GetDefaultEndpoint($flowIndex, $roleIndex)
+}
+
+function Set-WindowsAudioEndpointVolume {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Endpoint,
+        [Nullable[double]]$Percent,
+        [Nullable[double]]$Decibels,
+        [Nullable[bool]]$Muted
+    )
+
+    Initialize-AudioInterop
+    if ($null -ne $Percent -and $null -ne $Decibels) { throw 'Specify either Percent or Decibels, not both.' }
+    if ($null -ne $Percent) {
+        if ($Percent -lt 0 -or $Percent -gt 100) { throw 'Percent must be between 0 and 100.' }
+        [DSNTools.WindowsAudioProfile.CoreAudio]::SetVolumeScalar([string]$Endpoint.FullEndpointId, [single]($Percent / 100.0))
+    }
+    elseif ($null -ne $Decibels) {
+        [DSNTools.WindowsAudioProfile.CoreAudio]::SetVolumeDecibels([string]$Endpoint.FullEndpointId, [single]$Decibels)
+    }
+    if ($null -ne $Muted) {
+        [DSNTools.WindowsAudioProfile.CoreAudio]::SetMute([string]$Endpoint.FullEndpointId, [bool]$Muted)
+    }
+}
+
+function Set-WindowsAudioDefaultEndpoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$EndpointId,
+        [Parameter(Mandatory)][ValidateSet('console', 'multimedia', 'communications')][string]$Role
+    )
+
+    Initialize-AudioInterop
+    [DSNTools.WindowsAudioProfile.CoreAudio]::SetDefaultEndpoint($EndpointId, @('console', 'multimedia', 'communications').IndexOf($Role))
+}
+
+function Set-WindowsAudioEndpointVisibility {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$EndpointId,
+        [Parameter(Mandatory)][bool]$Visible
+    )
+
+    Initialize-AudioInterop
+    [DSNTools.WindowsAudioProfile.CoreAudio]::SetEndpointVisibility($EndpointId, $Visible)
+}
+
+function Set-WindowsAudioEndpointProperties {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Endpoint,
+        [AllowNull()][string]$Name,
+        [AllowNull()][string]$Icon,
+        [AllowNull()]$Format
+    )
+
+    Initialize-AudioInterop
+    if ($PSBoundParameters.ContainsKey('Format') -and $null -ne $Format) {
+        $bytes = ConvertTo-AudioWaveFormatBytes -Format $Format
+        [DSNTools.WindowsAudioProfile.CoreAudio]::SetBlobProperty(
+            [string]$Endpoint.FullEndpointId,
+            'f19f064d-082c-4e27-bc73-6882a1bb8e4c',
+            0,
+            $bytes
+        )
+    }
+    if ($PSBoundParameters.ContainsKey('Name')) {
+        if ([string]::IsNullOrWhiteSpace($Name)) { throw 'Audio endpoint name cannot be empty.' }
+        [DSNTools.WindowsAudioProfile.CoreAudio]::SetStringProperty(
+            [string]$Endpoint.FullEndpointId,
+            'a45c254e-df1c-4efd-8020-67d146a850e0',
+            2,
+            $Name
+        )
+    }
+    if ($PSBoundParameters.ContainsKey('Icon')) {
+        if ([string]::IsNullOrWhiteSpace($Icon)) { throw 'Audio endpoint icon cannot be empty.' }
+        [DSNTools.WindowsAudioProfile.CoreAudio]::SetStringProperty(
+            [string]$Endpoint.FullEndpointId,
+            '259abffc-50a7-47ce-af08-68c9a7d73366',
+            12,
+            $Icon
+        )
+    }
+}
+
+function Test-AudioObjectProperty {
+    param(
+        [AllowNull()]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $null -ne $Object -and $null -ne $Object.PSObject.Properties[$Name]
+}
+
+function Assert-AudioAllowedProperties {
+    param(
+        [AllowNull()]$Object,
+        [Parameter(Mandatory)][string[]]$Allowed,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    if ($null -eq $Object) { return }
+    foreach ($property in $Object.PSObject.Properties) {
+        if ($Allowed -notcontains $property.Name) { throw "Unknown property '$($property.Name)' in $Context." }
+    }
+}
+
+function Assert-AudioProfileShape {
+    param([Parameter(Mandatory)]$Document)
+
+    Assert-AudioAllowedProperties -Object $Document -Allowed @('$schema','schemaVersion','profile','target','devices','priority') -Context 'profile root'
+    Assert-AudioAllowedProperties -Object (Get-AudioObjectProperty $Document 'profile') -Allowed @('name','description','exportedAtUtc') -Context 'profile metadata'
+    Assert-AudioAllowedProperties -Object (Get-AudioObjectProperty $Document 'target') -Allowed @('computerName','machineIdSha256','binding') -Context 'target'
+    foreach ($device in @(Get-AudioObjectProperty $Document 'devices')) {
+        $key = [string](Get-AudioObjectProperty $device 'key')
+        Assert-AudioAllowedProperties -Object $device -Allowed @('key','required','match','settings') -Context "device '$key'"
+        Assert-AudioAllowedProperties -Object (Get-AudioObjectProperty $device 'match') -Allowed @('flow','endpointId','containerId','deviceInstanceId','hardwareIds','driverProvider','driverIdentity') -Context "device '$key' match"
+        $settings = Get-AudioObjectProperty $device 'settings'
+        Assert-AudioAllowedProperties -Object $settings -Allowed @('name','icon','enabled','volume','format') -Context "device '$key' settings"
+        Assert-AudioAllowedProperties -Object (Get-AudioObjectProperty $settings 'volume') -Allowed @('percent','decibels','muted') -Context "device '$key' volume"
+        Assert-AudioAllowedProperties -Object (Get-AudioObjectProperty $settings 'format') -Allowed @('channels','sampleRateHz','bitsPerSample','validBitsPerSample','encoding','channelMask','extensible') -Context "device '$key' format"
+    }
+    $priority = Get-AudioObjectProperty $Document 'priority'
+    Assert-AudioAllowedProperties -Object $priority -Allowed @('render','capture') -Context 'priority'
+    foreach ($flow in @('render','capture')) {
+        $flowPriority = Get-AudioObjectProperty $priority $flow
+        if ($null -eq $flowPriority) { continue }
+        Assert-AudioAllowedProperties -Object $flowPriority -Allowed @('allRoles','roles') -Context "priority.$flow"
+        $allRoles = Get-AudioObjectProperty $flowPriority 'allRoles'
+        Assert-AudioAllowedProperties -Object $allRoles -Allowed @('leastToMostPreferred') -Context "priority.$flow.allRoles"
+        $roles = Get-AudioObjectProperty $flowPriority 'roles'
+        Assert-AudioAllowedProperties -Object $roles -Allowed @('console','multimedia','communications') -Context "priority.$flow.roles"
+        foreach ($role in @('console','multimedia','communications')) {
+            Assert-AudioAllowedProperties -Object (Get-AudioObjectProperty $roles $role) -Allowed @('leastToMostPreferred') -Context "priority.$flow.roles.$role"
+        }
+    }
+}
+
+function Import-AudioProfile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    $document = [IO.File]::ReadAllText($resolvedPath, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    Assert-AudioProfileShape -Document $document
+    if ($null -eq $document -or -not (Test-AudioObjectProperty -Object $document -Name 'schemaVersion') -or [int]$document.schemaVersion -ne 1) {
+        throw 'Unsupported audio profile schemaVersion; expected 1.'
+    }
+    if (-not (Test-AudioObjectProperty -Object $document -Name 'devices')) {
+        throw 'Audio profile must contain a devices array.'
+    }
+    if (@($document.devices).Count -lt 1) {
+        throw 'Audio profile must contain at least one device.'
+    }
+
+    $target = Get-AudioObjectProperty -Object $document -Name 'target'
+    if ($null -ne $target -and (Test-AudioObjectProperty -Object $target -Name 'binding')) {
+        $binding = [string](Get-AudioObjectProperty -Object $target -Name 'binding')
+        if ($binding -notin @('strict', 'none')) { throw "target.binding must be strict or none; got '$binding'." }
+    }
+
+    $seenKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($device in @($document.devices)) {
+        $key = [string](Get-AudioObjectProperty -Object $device -Name 'key')
+        if ([string]::IsNullOrWhiteSpace($key)) { throw 'Every device requires a non-empty key.' }
+        if (-not $seenKeys.Add($key)) { throw "Duplicate device key: $key" }
+
+        $match = Get-AudioObjectProperty -Object $device -Name 'match'
+        $flow = [string](Get-AudioObjectProperty -Object $match -Name 'flow')
+        if ($flow -notin @('render', 'capture')) { throw "Device '$key' requires match.flow render or capture." }
+
+        $settings = Get-AudioObjectProperty -Object $device -Name 'settings'
+        $volume = Get-AudioObjectProperty -Object $settings -Name 'volume'
+        if ($null -ne $volume) {
+            $hasPercent = Test-AudioObjectProperty -Object $volume -Name 'percent'
+            $hasDecibels = Test-AudioObjectProperty -Object $volume -Name 'decibels'
+            if ($hasPercent -and $hasDecibels) {
+                throw "Device '$key' volume must contain either percent or decibels, not both."
+            }
+            if ($hasPercent -and ([double]$volume.percent -lt 0 -or [double]$volume.percent -gt 100)) {
+                throw "Device '$key' volume.percent must be between 0 and 100."
+            }
+        }
+        $format = Get-AudioObjectProperty -Object $settings -Name 'format'
+        if ($null -ne $format) { [void](ConvertTo-AudioWaveFormatBytes -Format $format) }
+    }
+    $document | Add-Member -NotePropertyName '_path' -NotePropertyValue $resolvedPath -Force
+    $document
+}
+
+function Test-AudioIdentityValueEqual {
+    param([AllowNull()]$Actual, [AllowNull()]$Expected)
+    if ($null -eq $Expected -or [string]::IsNullOrWhiteSpace([string]$Expected)) { return $true }
+    if ($null -eq $Actual) { return $false }
+    [string]::Equals(([string]$Actual).Trim(), ([string]$Expected).Trim(), [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-AudioEndpointFingerprint {
+    param(
+        [Parameter(Mandatory)]$Endpoint,
+        [Parameter(Mandatory)]$Match,
+        [switch]$IgnoreEndpointId
+    )
+
+    if (-not (Test-AudioIdentityValueEqual -Actual $Endpoint.Flow -Expected $Match.flow)) { return $false }
+    if (-not $IgnoreEndpointId -and (Test-AudioObjectProperty -Object $Match -Name 'endpointId')) {
+        if (-not (Test-AudioIdentityValueEqual -Actual $Endpoint.EndpointId -Expected $Match.endpointId)) { return $false }
+    }
+
+    foreach ($name in @('containerId', 'deviceInstanceId', 'driverProvider', 'driverIdentity')) {
+        if (Test-AudioObjectProperty -Object $Match -Name $name) {
+            $actualName = $name.Substring(0,1).ToUpperInvariant() + $name.Substring(1)
+            if (-not (Test-AudioIdentityValueEqual -Actual (Get-AudioObjectProperty -Object $Endpoint -Name $actualName) -Expected $Match.$name)) {
+                return $false
+            }
+        }
+    }
+
+    if (Test-AudioObjectProperty -Object $Match -Name 'hardwareIds') {
+        $expectedIds = @($Match.hardwareIds)
+        $actualIds = @(Get-AudioObjectProperty -Object $Endpoint -Name 'HardwareIds')
+        foreach ($expectedId in $expectedIds) {
+            if (-not @($actualIds | Where-Object { Test-AudioIdentityValueEqual -Actual $_ -Expected $expectedId }).Count) {
+                return $false
+            }
+        }
+    }
+    $true
+}
+
+function Get-AudioStrongFingerprintCount {
+    param([Parameter(Mandatory)]$Match)
+    $count = 0
+    foreach ($name in @('containerId', 'deviceInstanceId', 'hardwareIds')) {
+        if (Test-AudioObjectProperty -Object $Match -Name $name) {
+            $value = Get-AudioObjectProperty -Object $Match -Name $name
+            if ($null -ne $value -and @($value).Count -gt 0 -and -not [string]::IsNullOrWhiteSpace([string]@($value)[0])) { $count++ }
+        }
+    }
+    $count
+}
+
+function Get-AudioMachineHash {
+    [CmdletBinding()]
+    param()
+
+    $machineGuid = [string](Get-ItemPropertyValue -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGuid')
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($machineGuid)
+        ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function ConvertTo-AudioProfileKey {
+    param([Parameter(Mandatory)]$Endpoint, [Parameter(Mandatory)][AllowEmptyCollection()][Collections.Generic.HashSet[string]]$Used)
+
+    $slug = [regex]::Replace(([string]$Endpoint.Name).Trim().ToLowerInvariant(), '[^\p{L}\p{Nd}]+', '-').Trim('-')
+    if ([string]::IsNullOrWhiteSpace($slug)) { $slug = 'device' }
+    $baseKey = "$($Endpoint.Flow)-$slug"
+    $key = $baseKey
+    $suffix = 2
+    while (-not $Used.Add($key)) {
+        $key = "$baseKey-$suffix"
+        $suffix++
+    }
+    $key
+}
+
+function New-AudioProfileDocument {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object[]]$Inventory,
+        [string]$Name = 'Windows audio profile'
+    )
+
+    $usedKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $keyByEndpoint = @{}
+    $devices = [Collections.Generic.List[object]]::new()
+    foreach ($endpoint in $Inventory) {
+        $key = ConvertTo-AudioProfileKey -Endpoint $endpoint -Used $usedKeys
+        $keyByEndpoint["$($endpoint.Flow)/$($endpoint.EndpointId)"] = $key
+        $match = [ordered]@{
+            flow = $endpoint.Flow
+            endpointId = $endpoint.EndpointId
+        }
+        foreach ($pair in @(
+            @('containerId', $endpoint.ContainerId),
+            @('deviceInstanceId', $endpoint.DeviceInstanceId),
+            @('hardwareIds', @($endpoint.HardwareIds)),
+            @('driverIdentity', $endpoint.DriverIdentity)
+        )) {
+            $value = $pair[1]
+            if ($value -is [array]) {
+                if (@($value).Count -gt 0) { $match[$pair[0]] = @($value) }
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace([string]$value)) { $match[$pair[0]] = $value }
+        }
+
+        $settings = [ordered]@{
+            name = $endpoint.Name
+            icon = $endpoint.Icon
+            enabled = [bool]$endpoint.Enabled
+        }
+        if ($null -ne $endpoint.Format) { $settings.format = $endpoint.Format }
+        if ($endpoint.Active) {
+            try {
+                $volume = Get-WindowsAudioEndpointVolume -Endpoint $endpoint
+                $settings.volume = [ordered]@{ percent = $volume.percent; muted = $volume.muted }
+            }
+            catch {
+            }
+        }
+        $devices.Add([ordered]@{
+            key = $key
+            required = $true
+            match = $match
+            settings = $settings
+        })
+    }
+
+    $priority = [ordered]@{}
+    foreach ($flow in @('render', 'capture')) {
+        $eligible = @($Inventory | Where-Object { $_.Flow -eq $flow -and -not $_.NeverSetAsDefault })
+        if ($eligible.Count -eq 0) { continue }
+        $orders = @{}
+        foreach ($role in @('console', 'multimedia', 'communications')) {
+            $orders[$role] = @($eligible | Sort-Object @{ Expression = {
+                $value = Get-AudioObjectProperty -Object $_.Levels -Name $role
+                if ($null -eq $value) { [int64]::MinValue } else { [int64]$value }
+            } }, @{ Expression = { $_.EndpointId } } | ForEach-Object { $keyByEndpoint["$flow/$($_.EndpointId)"] })
+        }
+        $flowPriority = [ordered]@{
+            allRoles = [ordered]@{ leastToMostPreferred = @($orders.console) }
+        }
+        $roleOverrides = [ordered]@{}
+        foreach ($role in @('multimedia', 'communications')) {
+            if ((@($orders[$role]) -join "`n") -ne (@($orders.console) -join "`n")) {
+                $roleOverrides[$role] = [ordered]@{ leastToMostPreferred = @($orders[$role]) }
+            }
+        }
+        if ($roleOverrides.Count -gt 0) { $flowPriority.roles = $roleOverrides }
+        $priority[$flow] = $flowPriority
+    }
+
+    [ordered]@{
+        '$schema' = './audio-profile.schema.json'
+        schemaVersion = 1
+        profile = [ordered]@{ name = $Name; exportedAtUtc = (Get-Date).ToUniversalTime().ToString('o') }
+        target = [ordered]@{
+            computerName = $env:COMPUTERNAME
+            machineIdSha256 = Get-AudioMachineHash
+            binding = 'strict'
+        }
+        devices = @($devices)
+        priority = $priority
+    }
+}
+
+function Get-AudioIconSourceFile {
+    param([Parameter(Mandatory)][string]$Icon)
+    $expanded = [Environment]::ExpandEnvironmentVariables($Icon)
+    $match = [regex]::Match($expanded, '^(?<path>.*),(?<index>-?\d+)$')
+    $path = if ($match.Success) { $match.Groups['path'].Value } else { $expanded }
+    if (-not [IO.Path]::IsPathRooted($path)) { throw "Icon source must be an absolute path after environment expansion: $Icon" }
+    [IO.Path]::GetFullPath($path)
+}
+
+function Test-AudioProfileState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][object[]]$Inventory,
+        [switch]$IgnoreMachineBinding
+    )
+
+    $errors = [Collections.Generic.List[object]]::new()
+    $warnings = [Collections.Generic.List[object]]::new()
+    try {
+        $target = Get-AudioObjectProperty -Object $Profile -Name 'target'
+        if (-not $IgnoreMachineBinding -and $null -ne $target -and [string](Get-AudioObjectProperty -Object $target -Name 'binding') -eq 'strict') {
+            $expectedHash = [string](Get-AudioObjectProperty -Object $target -Name 'machineIdSha256')
+            if (-not [string]::IsNullOrWhiteSpace($expectedHash) -and -not [string]::Equals($expectedHash, (Get-AudioMachineHash), [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'Profile machine binding does not match this Windows installation.'
+            }
+        }
+        $resolved = Resolve-AudioProfileDevices -Profile $Profile -Inventory $Inventory
+        [void](Get-AudioPriorityAssignments -Profile $Profile -ResolvedDevices $resolved -Inventory $Inventory)
+        foreach ($device in @($Profile.devices)) {
+            $endpoint = $resolved[[string]$device.key]
+            if ($null -eq $endpoint) {
+                $warnings.Add([pscustomobject]@{ code='optionalDeviceMissing'; device=$device.key; message='Optional device is not registered.' })
+                continue
+            }
+            $settings = Get-AudioObjectProperty -Object $device -Name 'settings'
+            $icon = Get-AudioObjectProperty -Object $settings -Name 'icon'
+            if (-not [string]::IsNullOrWhiteSpace([string]$icon)) {
+                $source = Get-AudioIconSourceFile -Icon ([string]$icon)
+                if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Icon source is missing for '$($device.key)': $source" }
+            }
+            $volume = Get-AudioObjectProperty -Object $settings -Name 'volume'
+            if ($null -ne $volume -and -not $endpoint.Active) {
+                $warnings.Add([pscustomobject]@{ code='volumeRequiresActiveEndpoint'; device=$device.key; message='Volume can only be checked after the endpoint becomes active.' })
+            }
+        }
+    }
+    catch {
+        $errors.Add([pscustomobject]@{ code='validationFailed'; message=$_.Exception.Message })
+        $resolved = @{}
+    }
+    [pscustomobject][ordered]@{
+        valid = $errors.Count -eq 0
+        matchedDevices = @($resolved.Values | Where-Object { $null -ne $_ }).Count
+        warnings = @($warnings)
+        errors = @($errors)
+    }
+}
+
+function New-AudioBackupDocument {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][hashtable]$ResolvedDevices,
+        [Parameter(Mandatory)][object[]]$Inventory
+    )
+
+    $devices = [Collections.Generic.List[object]]::new()
+    foreach ($profileDevice in @($Profile.devices)) {
+        $endpoint = $ResolvedDevices[[string]$profileDevice.key]
+        if ($null -eq $endpoint) { continue }
+        $volume = $null
+        if ($endpoint.Active) {
+            try { $volume = Get-WindowsAudioEndpointVolume -Endpoint $endpoint } catch { }
+        }
+        $settings = Get-AudioObjectProperty -Object $profileDevice -Name 'settings'
+        $touched = [Collections.Generic.List[string]]::new()
+        foreach ($property in @('name', 'icon', 'enabled', 'format', 'volume')) {
+            if (Test-AudioObjectProperty -Object $settings -Name $property) { $touched.Add($property) }
+        }
+        $devices.Add([ordered]@{
+            key = [string]$profileDevice.key
+            flow = $endpoint.Flow
+            endpointId = $endpoint.EndpointId
+            fullEndpointId = $endpoint.FullEndpointId
+            name = $endpoint.Name
+            icon = $endpoint.Icon
+            enabled = [bool]$endpoint.Enabled
+            format = $endpoint.Format
+            volume = $volume
+            levels = $endpoint.Levels
+            touched = @($touched)
+        })
+    }
+    $defaults = [Collections.Generic.List[object]]::new()
+    foreach ($flow in @('render', 'capture')) {
+        foreach ($role in @('console', 'multimedia', 'communications')) {
+            $defaults.Add([ordered]@{ flow=$flow; role=$role; endpointId=(Get-WindowsAudioDefaultEndpoint -Flow $flow -Role $role) })
+        }
+    }
+    [ordered]@{
+        version = 1
+        createdAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        machineIdSha256 = Get-AudioMachineHash
+        sourceProfile = [string](Get-AudioObjectProperty -Object $Profile -Name '_path')
+        priorityIncluded = $null -ne (Get-AudioObjectProperty -Object $Profile -Name 'priority')
+        devices = @($devices)
+        defaults = @($defaults)
+    }
+}
+
+function Get-AudioProfileDifferences {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][hashtable]$ResolvedDevices,
+        [Parameter(Mandatory)][object[]]$Inventory
+    )
+
+    $differences = [Collections.Generic.List[object]]::new()
+    foreach ($profileDevice in @($Profile.devices)) {
+        $key = [string]$profileDevice.key
+        $originalEndpoint = $ResolvedDevices[$key]
+        if ($null -eq $originalEndpoint) { continue }
+        $endpoint = @($Inventory | Where-Object { $_.Flow -eq $originalEndpoint.Flow -and $_.EndpointId -eq $originalEndpoint.EndpointId })[0]
+        if ($null -eq $endpoint) {
+            $differences.Add([pscustomobject]@{ device=$key; property='endpoint'; expected='present'; actual='missing' })
+            continue
+        }
+        $settings = Get-AudioObjectProperty -Object $profileDevice -Name 'settings'
+        foreach ($property in @('name', 'icon', 'enabled')) {
+            if (-not (Test-AudioObjectProperty -Object $settings -Name $property)) { continue }
+            $actualName = $property.Substring(0,1).ToUpperInvariant() + $property.Substring(1)
+            $expected = Get-AudioObjectProperty -Object $settings -Name $property
+            $actual = Get-AudioObjectProperty -Object $endpoint -Name $actualName
+            $equal = if ($property -eq 'enabled') { [bool]$expected -eq [bool]$actual }
+            else { [string]::Equals([string]$expected, [string]$actual, [StringComparison]::OrdinalIgnoreCase) }
+            if (-not $equal) { $differences.Add([pscustomobject]@{ device=$key; property=$property; expected=$expected; actual=$actual }) }
+        }
+        $expectedFormat = Get-AudioObjectProperty -Object $settings -Name 'format'
+        if ($null -ne $expectedFormat) {
+            foreach ($property in @('channels', 'sampleRateHz', 'bitsPerSample', 'validBitsPerSample', 'encoding', 'channelMask')) {
+                if (-not (Test-AudioObjectProperty -Object $expectedFormat -Name $property)) { continue }
+                $expected = Get-AudioObjectProperty -Object $expectedFormat -Name $property
+                $actual = Get-AudioObjectProperty -Object $endpoint.Format -Name $property
+                if ([string]$expected -ne [string]$actual) { $differences.Add([pscustomobject]@{ device=$key; property="format.$property"; expected=$expected; actual=$actual }) }
+            }
+        }
+        $expectedVolume = Get-AudioObjectProperty -Object $settings -Name 'volume'
+        if ($null -ne $expectedVolume -and $endpoint.Active) {
+            try {
+                $actualVolume = Get-WindowsAudioEndpointVolume -Endpoint $endpoint
+                foreach ($property in @('percent', 'decibels')) {
+                    if ((Test-AudioObjectProperty -Object $expectedVolume -Name $property) -and [Math]::Abs([double]$expectedVolume.$property - [double]$actualVolume.$property) -gt 0.11) {
+                        $differences.Add([pscustomobject]@{ device=$key; property="volume.$property"; expected=$expectedVolume.$property; actual=$actualVolume.$property })
+                    }
+                }
+                if ((Test-AudioObjectProperty -Object $expectedVolume -Name 'muted') -and [bool]$expectedVolume.muted -ne [bool]$actualVolume.muted) {
+                    $differences.Add([pscustomobject]@{ device=$key; property='volume.muted'; expected=$expectedVolume.muted; actual=$actualVolume.muted })
+                }
+            }
+            catch {
+                $differences.Add([pscustomobject]@{ device=$key; property='volume'; expected='readable'; actual=$_.Exception.Message })
+            }
+        }
+    }
+
+    $priority = Get-AudioObjectProperty -Object $Profile -Name 'priority'
+    if ($null -ne $priority) {
+        $assignments = @(Get-AudioPriorityAssignments -Profile $Profile -ResolvedDevices $ResolvedDevices -Inventory $Inventory)
+        $keyByEndpoint = @{}
+        foreach ($pair in $ResolvedDevices.GetEnumerator()) {
+            if ($null -ne $pair.Value) { $keyByEndpoint["$($pair.Value.Flow)/$($pair.Value.EndpointId)"] = [string]$pair.Key }
+        }
+        foreach ($flow in @('render', 'capture')) {
+            foreach ($role in @('console', 'multimedia', 'communications')) {
+                $expectedOrder = @($assignments | Where-Object { $_.Flow -eq $flow -and $_.Role -eq $role } | Sort-Object Level | ForEach-Object { $_.Key })
+                if ($expectedOrder.Count -eq 0) { continue }
+                $actualOrder = @($Inventory | Where-Object { $_.Flow -eq $flow -and -not $_.NeverSetAsDefault } | Sort-Object @{ Expression = {
+                    $value = Get-AudioObjectProperty -Object $_.Levels -Name $role
+                    if ($null -eq $value) { [int64]::MinValue } else { [int64]$value }
+                } }, @{ Expression = { $_.EndpointId } } | ForEach-Object { $keyByEndpoint["$flow/$($_.EndpointId)"] })
+                if (($expectedOrder -join "`n") -ne ($actualOrder -join "`n")) {
+                    $differences.Add([pscustomobject]@{ device=$flow; property="priority.$role"; expected=$expectedOrder; actual=$actualOrder })
+                }
+            }
+        }
+    }
+    @($differences)
+}
+
+function Get-AudioPriorityRegistryOperations {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$AudioRoot,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Assignments
+    )
+
+    foreach ($assignment in $Assignments) {
+        $registryFlow = if ([string]$assignment.flow -eq 'render') { 'Render' } elseif ([string]$assignment.flow -eq 'capture') { 'Capture' } else { throw "Invalid priority flow '$($assignment.flow)'." }
+        $roleIndex = [int]$assignment.roleIndex
+        if ($roleIndex -lt 0 -or $roleIndex -gt 2) { throw "Invalid priority role index '$roleIndex'." }
+        $path = Join-Path $AudioRoot "$registryFlow\$($assignment.endpointId)"
+        $hasValueProperty = $assignment.PSObject.Properties['hasValue']
+        $hasValue = if ($null -eq $hasValueProperty) { $null -ne $assignment.level } else { [bool]$hasValueProperty.Value }
+        [pscustomobject]@{
+            Path = $path
+            Name = "Level:$roleIndex"
+            Action = if ($hasValue) { 'Set' } else { 'Remove' }
+            Value = if ($hasValue) { [int64]$assignment.level } else { $null }
+        }
+    }
+}
+
+function Set-AudioPriorityRegistryValues {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$AudioRoot,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Assignments
+    )
+
+    $operations = @(Get-AudioPriorityRegistryOperations -AudioRoot $AudioRoot -Assignments $Assignments)
+    foreach ($operation in $operations) {
+        if (-not (Test-Path -LiteralPath $operation.Path -PathType Container)) { throw "Audio endpoint registry key is missing: $($operation.Path)" }
+        if ($operation.Action -eq 'Set') {
+            New-ItemProperty -LiteralPath $operation.Path -Name $operation.Name -PropertyType QWord -Value $operation.Value -Force | Out-Null
+        }
+        else {
+            Remove-ItemProperty -LiteralPath $operation.Path -Name $operation.Name -ErrorAction SilentlyContinue
+        }
+    }
+    foreach ($operation in $operations) {
+        $property = (Get-ItemProperty -LiteralPath $operation.Path).PSObject.Properties[$operation.Name]
+        if ($operation.Action -eq 'Set' -and ($null -eq $property -or [int64]$property.Value -ne [int64]$operation.Value)) {
+            throw "Priority verification failed for $($operation.Path) $($operation.Name)."
+        }
+        if ($operation.Action -eq 'Remove' -and $null -ne $property) { throw "Priority removal verification failed for $($operation.Path) $($operation.Name)." }
+    }
+    @($operations)
+}
+
+function Resolve-AudioProfileDevices {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][object[]]$Inventory
+    )
+
+    $resolved = @{}
+    foreach ($device in @($Profile.devices)) {
+        $key = [string]$device.key
+        $match = $device.match
+        $required = -not (Test-AudioObjectProperty -Object $device -Name 'required') -or [bool]$device.required
+        $flowCandidates = @($Inventory | Where-Object { Test-AudioIdentityValueEqual -Actual $_.Flow -Expected $match.flow })
+        $exact = @()
+        if (Test-AudioObjectProperty -Object $match -Name 'endpointId') {
+            $exact = @($flowCandidates | Where-Object {
+                (Test-AudioIdentityValueEqual -Actual $_.EndpointId -Expected $match.endpointId) -and
+                (Test-AudioEndpointFingerprint -Endpoint $_ -Match $match)
+            })
+        }
+
+        if ($exact.Count -eq 1) {
+            $resolved[$key] = $exact[0]
+            continue
+        }
+        if ($exact.Count -gt 1) { throw "Device '$key' matched $($exact.Count) endpoints by endpointId." }
+
+        $strongCount = Get-AudioStrongFingerprintCount -Match $match
+        $stable = @(if ($strongCount -ge 2) {
+            $flowCandidates | Where-Object { Test-AudioEndpointFingerprint -Endpoint $_ -Match $match -IgnoreEndpointId }
+        })
+
+        if ($stable.Count -eq 1) {
+            $resolved[$key] = $stable[0]
+        }
+        elseif ($stable.Count -gt 1) {
+            throw "Device '$key' matched $($stable.Count) endpoints by stable identity."
+        }
+        elseif ($required) {
+            throw "Required device '$key' did not match any endpoint."
+        }
+        else {
+            $resolved[$key] = $null
+        }
+    }
+    $claimedEndpoints = @{}
+    foreach ($pair in $resolved.GetEnumerator()) {
+        if ($null -eq $pair.Value) { continue }
+        $identity = "$($pair.Value.Flow)/$($pair.Value.EndpointId)"
+        if ($claimedEndpoints.ContainsKey($identity)) {
+            throw "Device '$($pair.Key)' and device '$($claimedEndpoints[$identity])' resolve to the same endpoint '$identity'."
+        }
+        $claimedEndpoints[$identity] = [string]$pair.Key
+    }
+    $resolved
+}
+
+function Get-AudioPriorityAssignments {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Profile,
+        [Parameter(Mandatory)][hashtable]$ResolvedDevices,
+        [Parameter(Mandatory)][object[]]$Inventory
+    )
+
+    $assignments = [Collections.Generic.List[object]]::new()
+    $priority = Get-AudioObjectProperty -Object $Profile -Name 'priority'
+    if ($null -eq $priority) { return @() }
+    $profileDevices = @{}
+    foreach ($device in @($Profile.devices)) { $profileDevices[[string]$device.key] = $device }
+
+    foreach ($flow in @('render', 'capture')) {
+        $flowPriority = Get-AudioObjectProperty -Object $priority -Name $flow
+        if ($null -eq $flowPriority) { continue }
+
+        $eligibleEndpoints = @($Inventory | Where-Object {
+            (Test-AudioIdentityValueEqual -Actual $_.Flow -Expected $flow) -and
+            -not [bool](Get-AudioObjectProperty -Object $_ -Name 'NeverSetAsDefault')
+        })
+        $eligibleKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($pair in $ResolvedDevices.GetEnumerator()) {
+            if ($null -ne $pair.Value -and @($eligibleEndpoints | Where-Object {
+                Test-AudioIdentityValueEqual -Actual $_.EndpointId -Expected $pair.Value.EndpointId
+            }).Count -eq 1) {
+                [void]$eligibleKeys.Add([string]$pair.Key)
+            }
+        }
+
+        $allRoles = Get-AudioObjectProperty -Object $flowPriority -Name 'allRoles'
+        if ($null -eq $allRoles) { throw "Flow '$flow' requires an allRoles priority list." }
+        $baseOrder = @(Get-AudioObjectProperty -Object $allRoles -Name 'leastToMostPreferred')
+        $roleOverrides = Get-AudioObjectProperty -Object $flowPriority -Name 'roles'
+
+        foreach ($role in @('console', 'multimedia', 'communications')) {
+            $order = $baseOrder
+            $override = Get-AudioObjectProperty -Object $roleOverrides -Name $role
+            if ($null -ne $override) { $order = @(Get-AudioObjectProperty -Object $override -Name 'leastToMostPreferred') }
+
+            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $includedEligible = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($key in $order) {
+                if (-not $seen.Add([string]$key)) { throw "Flow '$flow' role '$role' contains duplicate device key '$key'." }
+                if (-not $profileDevices.ContainsKey([string]$key)) { throw "Flow '$flow' role '$role' references unknown device '$key'." }
+                $resolvedEndpoint = $ResolvedDevices[[string]$key]
+                if ($null -eq $resolvedEndpoint) {
+                    $profileDevice = $profileDevices[[string]$key]
+                    $required = -not (Test-AudioObjectProperty -Object $profileDevice -Name 'required') -or [bool]$profileDevice.required
+                    if ($required) { throw "Flow '$flow' role '$role' references missing required device '$key'." }
+                    continue
+                }
+                if (-not $eligibleKeys.Contains([string]$key)) { throw "Flow '$flow' role '$role' references ineligible device '$key'." }
+                [void]$includedEligible.Add([string]$key)
+            }
+            if ($includedEligible.Count -ne $eligibleEndpoints.Count) {
+                throw "Flow '$flow' role '$role' requires a complete priority list of $($eligibleEndpoints.Count) registered endpoints; got $($includedEligible.Count)."
+            }
+
+            for ($index = 0; $index -lt $order.Count; $index++) {
+                $key = [string]$order[$index]
+                if ($null -eq $ResolvedDevices[$key]) { continue }
+                $assignments.Add([pscustomobject]@{
+                    Flow = $flow
+                    Role = $role
+                    RoleIndex = @('console', 'multimedia', 'communications').IndexOf($role)
+                    Key = $key
+                    EndpointId = $ResolvedDevices[$key].EndpointId
+                    Level = [int64](1000 + $index)
+                })
+            }
+        }
+    }
+    @($assignments)
+}
+
+Export-ModuleMember -Function Import-AudioProfile,Resolve-AudioProfileDevices,Get-AudioPriorityAssignments,ConvertFrom-AudioWaveFormat,ConvertTo-AudioWaveFormatBytes,Get-WindowsAudioInventory,Initialize-AudioInterop,Get-WindowsAudioEndpointVolume,Get-WindowsAudioDefaultEndpoint,Set-WindowsAudioEndpointVolume,Set-WindowsAudioDefaultEndpoint,Set-WindowsAudioEndpointVisibility,Set-WindowsAudioEndpointProperties,Get-AudioMachineHash,New-AudioProfileDocument,Get-AudioIconSourceFile,Test-AudioProfileState,New-AudioBackupDocument,Get-AudioProfileDifferences,Get-AudioPriorityRegistryOperations,Set-AudioPriorityRegistryValues
