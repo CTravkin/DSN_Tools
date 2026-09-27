@@ -63,13 +63,25 @@ namespace DSNTools.WindowsAudioProfile
         int Activate(ref Guid iid, ClsCtx clsCtx, IntPtr activationParams, [MarshalAs(UnmanagedType.IUnknown)] out object instance);
 
         [PreserveSig]
-        int OpenPropertyStore(uint access, out IntPtr properties);
+        int OpenPropertyStore(uint access, out IPropertyStore properties);
 
         [PreserveSig]
         int GetId([MarshalAs(UnmanagedType.LPWStr)] out string id);
 
         [PreserveSig]
         int GetState(out uint state);
+    }
+
+    [ComImport]
+    [Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    internal interface IPropertyStore
+    {
+        [PreserveSig] int GetCount(out uint propertyCount);
+        [PreserveSig] int GetAt(uint propertyIndex, out PropertyKey key);
+        [PreserveSig] int GetValue(ref PropertyKey key, out PropVariant value);
+        [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+        [PreserveSig] int Commit();
     }
 
     [ComImport]
@@ -139,8 +151,18 @@ namespace DSNTools.WindowsAudioProfile
         public uint PropertyId;
     }
 
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    internal struct PropVariant
+    {
+        [FieldOffset(0)] public ushort VariantType;
+        [FieldOffset(8)] public IntPtr PointerValue;
+    }
+
     public static class CoreAudio
     {
+        [DllImport("ole32.dll")]
+        private static extern int PropVariantClear(ref PropVariant value);
+
         private static void Check(int result, string operation)
         {
             if (result < 0) Marshal.ThrowExceptionForHR(result, new IntPtr(-1));
@@ -255,6 +277,34 @@ namespace DSNTools.WindowsAudioProfile
             finally
             {
                 if (volume != null) Marshal.FinalReleaseComObject(volume);
+                if (device != null) Marshal.FinalReleaseComObject(device);
+                if (enumerator != null) Marshal.FinalReleaseComObject(enumerator);
+            }
+        }
+
+        public static string GetStableId(string endpointId)
+        {
+            IMMDeviceEnumerator enumerator = null;
+            IMMDevice device = null;
+            IPropertyStore properties = null;
+            PropVariant value = new PropVariant();
+            try
+            {
+                enumerator = CreateEnumerator();
+                Check(enumerator.GetDevice(endpointId, out device), "IMMDeviceEnumerator.GetDevice");
+                if (device.OpenPropertyStore(0, out properties) < 0) return null;
+                PropertyKey key = new PropertyKey
+                {
+                    FormatId = new Guid("1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E"),
+                    PropertyId = 12
+                };
+                if (properties.GetValue(ref key, out value) < 0 || value.VariantType != 31 || value.PointerValue == IntPtr.Zero) return null;
+                return Marshal.PtrToStringUni(value.PointerValue);
+            }
+            finally
+            {
+                PropVariantClear(ref value);
+                if (properties != null) Marshal.FinalReleaseComObject(properties);
                 if (device != null) Marshal.FinalReleaseComObject(device);
                 if (enumerator != null) Marshal.FinalReleaseComObject(enumerator);
             }

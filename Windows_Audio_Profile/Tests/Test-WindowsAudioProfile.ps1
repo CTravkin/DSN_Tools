@@ -209,6 +209,16 @@ try {
     $invalidEndpointIdPath = Write-TestProfile -Document $invalidEndpointId
     Assert-Throws { Import-AudioProfile -Path $invalidEndpointIdPath } 'endpointId.*GUID' 'Invalid endpoint IDs must be rejected during import.'
 
+    $invalidStableId = New-ValidProfile
+    $invalidStableId.devices[0].match.stableId = 42
+    $invalidStableIdPath = Write-TestProfile -Document $invalidStableId
+    Assert-Throws { Import-AudioProfile -Path $invalidStableIdPath } 'stableId.*string' 'Stable IDs must remain opaque JSON strings.'
+
+    $emptyStableId = New-ValidProfile
+    $emptyStableId.devices[0].match.stableId = ''
+    $emptyStableIdPath = Write-TestProfile -Document $emptyStableId
+    Assert-Throws { Import-AudioProfile -Path $emptyStableIdPath } 'stableId.*non-empty' 'Empty Stable IDs must be rejected during import.'
+
     $scalarHardwareIds = New-ValidProfile
     $scalarHardwareIds.devices[0].match.hardwareIds = 'USB\VID_0001&PID_0001'
     $scalarHardwareIdsPath = Write-TestProfile -Document $scalarHardwareIds
@@ -265,6 +275,48 @@ try {
     $resolved = Resolve-AudioProfileDevices -Profile $profile -Inventory $inventory
     Assert-True ($resolved['speakers'].EndpointId -eq '{11111111-1111-1111-1111-111111111111}') 'Exact endpoint identity must resolve.'
     Assert-True ($resolved['headphones'].EndpointId -eq '{99999999-9999-9999-9999-999999999999}') 'Stable identity must survive an endpoint ID change.'
+
+    $stableIdProfileDocument = New-ValidProfile
+    $stableIdProfileDocument.devices = @($stableIdProfileDocument.devices[0])
+    $stableIdProfileDocument.Remove('priority')
+    $stableIdProfileDocument.devices[0].match.stableId = 'Stable/Render/Primary'
+    $stableIdProfilePath = Write-TestProfile -Document $stableIdProfileDocument
+    $stableIdProfile = Import-AudioProfile -Path $stableIdProfilePath
+    $stableIdInventory = @(
+        [pscustomobject]@{
+            Flow='render'; EndpointId='{77777777-7777-7777-7777-777777777777}'; StableId='Stable/Render/Primary'
+            ContainerId='{dddddddd-dddd-dddd-dddd-dddddddddddd}'; DeviceInstanceId='USB\VID_9999&PID_9999\NEW'
+            HardwareIds=@('USB\VID_9999&PID_9999'); DriverProvider='Microsoft'; NeverSetAsDefault=$false
+        }
+    )
+    $stableIdResolved = Resolve-AudioProfileDevices -Profile $stableIdProfile -Inventory $stableIdInventory
+    Assert-True ($stableIdResolved['speakers'].EndpointId -eq '{77777777-7777-7777-7777-777777777777}') 'StableId must resolve an endpoint after its installation-derived identity changes.'
+
+    $wrongCaseStableIdInventory = @(
+        [pscustomobject]@{
+            Flow='render'; EndpointId='{77777777-7777-7777-7777-777777777777}'; StableId='stable/render/primary'
+            ContainerId='{dddddddd-dddd-dddd-dddd-dddddddddddd}'; DeviceInstanceId='USB\VID_9999&PID_9999\NEW'
+            HardwareIds=@('USB\VID_9999&PID_9999'); DriverProvider='Microsoft'; NeverSetAsDefault=$false
+        }
+    )
+    Assert-Throws { Resolve-AudioProfileDevices -Profile $stableIdProfile -Inventory $wrongCaseStableIdInventory } 'did not match any endpoint' 'StableId matching must remain case-sensitive.'
+
+    $legacyFallbackInventory = @(
+        [pscustomobject]@{
+            Flow='render'; EndpointId='{55555555-5555-5555-5555-555555555555}'; StableId=$null
+            ContainerId='{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}'; DeviceInstanceId='USB\VID_0001&PID_0001\A'
+            HardwareIds=@('USB\VID_0001&PID_0001'); DriverProvider='Microsoft'; NeverSetAsDefault=$false
+        }
+    )
+    $legacyFallbackResolved = Resolve-AudioProfileDevices -Profile $stableIdProfile -Inventory $legacyFallbackInventory
+    Assert-True ($legacyFallbackResolved['speakers'].EndpointId -eq '{55555555-5555-5555-5555-555555555555}') 'Legacy anchors must remain a fallback when Windows does not expose StableId.'
+
+    $ambiguousStableIdInventory = @($stableIdInventory) + [pscustomobject]@{
+        Flow='render'; EndpointId='{66666666-6666-6666-6666-666666666666}'; StableId='Stable/Render/Primary'
+        ContainerId='{eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee}'; DeviceInstanceId='USB\VID_8888&PID_8888\NEW'
+        HardwareIds=@('USB\VID_8888&PID_8888'); DriverProvider='Microsoft'; NeverSetAsDefault=$false
+    }
+    Assert-Throws { Resolve-AudioProfileDevices -Profile $stableIdProfile -Inventory $ambiguousStableIdInventory } 'matched 2 endpoints by stableId' 'Ambiguous StableId values must fail closed.'
 
     $duplicateEndpointProfile = New-ValidProfile
     $duplicateEndpointProfile.devices[1].match = @{
@@ -371,12 +423,18 @@ try {
 
     $noIconEndpoint = [pscustomobject]@{
         Flow='render'; EndpointId='{33333333-3333-3333-3333-333333333333}'; FullEndpointId='{0.0.0.00000000}.{33333333-3333-3333-3333-333333333333}'; Name='No icon'
+        StableId='Stable/Render/NoIcon'
         ContainerId='{cccccccc-cccc-cccc-cccc-cccccccccccc}'; DeviceInstanceId='ROOT\NOICON\1'
         HardwareIds=@(); DriverIdentity='test'; Icon=''; Format=$null; Enabled=$true; Active=$false
         NeverSetAsDefault=$true; Levels=[pscustomobject]@{ console=$null; multimedia=$null; communications=$null }
     }
     $noIconProfile = New-AudioProfileDocument -Inventory @($noIconEndpoint)
     Assert-True (-not $noIconProfile.devices[0].settings.Contains('icon')) 'Export must omit an absent icon instead of violating its schema.'
+    Assert-True ($noIconProfile.devices[0].match.stableId -eq 'Stable/Render/NoIcon') 'Export must preserve an available opaque StableId.'
+    $noStableIdEndpoint = $noIconEndpoint.PSObject.Copy()
+    $noStableIdEndpoint.StableId = $null
+    $noStableIdProfile = New-AudioProfileDocument -Inventory @($noStableIdEndpoint)
+    Assert-True (-not $noStableIdProfile.devices[0].match.Contains('stableId')) 'Export must omit StableId when Windows does not provide one.'
     $unrestorableIconProfile = [pscustomobject]@{ devices=@([pscustomobject]@{ key='no-icon'; settings=[pscustomobject]@{ icon='C:\Windows\System32\mmres.dll,-1' } }) }
     Assert-Throws { New-AudioBackupDocument -Profile $unrestorableIconProfile -ResolvedDevices @{ 'no-icon'=$noIconEndpoint } -Inventory @($noIconEndpoint) } 'reversible backup.*icon' 'Apply must stop before changing an icon whose absent original value cannot be restored.'
 
@@ -386,6 +444,11 @@ try {
     Assert-True ($firstLiveEndpoint.Flow -in @('render', 'capture')) 'Every live endpoint must have a supported flow.'
     Assert-True ($firstLiveEndpoint.EndpointId -match '^\{[0-9a-f-]{36}\}$') 'Every live endpoint must expose a GUID endpoint ID.'
     Assert-True (-not [string]::IsNullOrWhiteSpace([string]$firstLiveEndpoint.Name)) 'Every live endpoint must expose a display name.'
+    Assert-True ($null -ne $firstLiveEndpoint.PSObject.Properties['StableId']) 'Every inventory item must expose the optional StableId field.'
+    $liveStableIds = @($liveInventory | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.StableId) })
+    foreach ($endpoint in $liveStableIds) {
+        Assert-True ($endpoint.StableId -is [string]) 'Every available StableId must remain an opaque string.'
+    }
     $uniqueLiveIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($endpoint in $liveInventory) {
         Assert-True ($uniqueLiveIds.Add("$($endpoint.Flow)/$($endpoint.EndpointId)")) 'Flow and endpoint ID pairs must be unique.'
@@ -418,6 +481,7 @@ try {
     $exportedProfile = Get-Content -Raw -LiteralPath $exportedProfilePath | ConvertFrom-Json
     Assert-True (@($exportedProfile.devices).Count -eq $liveInventory.Count) 'Profile export must include all registered endpoints.'
     Assert-True ($exportedProfile.target.binding -eq 'strict') 'Profile export must bind to the source computer by default.'
+    Assert-True (@($exportedProfile.devices | Where-Object { $null -ne $_.match.PSObject.Properties['stableId'] }).Count -eq $liveStableIds.Count) 'Profile export must preserve every available StableId and omit unavailable values.'
 
     $testResult = Invoke-JsonScript -Script $testScript -Arguments @('-ProfilePath', $exportedProfilePath, '-Json')
     Assert-True ($testResult.ExitCode -eq 0) "A freshly exported profile must validate on the same machine: $($testResult.Error)"

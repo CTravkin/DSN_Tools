@@ -173,10 +173,13 @@ function Get-WindowsAudioInventory {
                 $levels[@('console', 'multimedia', 'communications')[$roleIndex]] = if ($null -eq $levelProperty) { $null } else { [int64]$levelProperty.Value }
             }
             $endpointId = $endpointKey.PSChildName
+            $fullEndpointId = "{0.0.$fullIdFlow.00000000}.$endpointId"
+            $stableId = try { Get-WindowsAudioEndpointStableId -EndpointId $fullEndpointId } catch { $null }
             $result.Add([pscustomobject][ordered]@{
                 Flow = $flow
                 EndpointId = $endpointId
-                FullEndpointId = "{0.0.$fullIdFlow.00000000}.$endpointId"
+                FullEndpointId = $fullEndpointId
+                StableId = $stableId
                 Name = [string](& $readProperty $propertyNames.Name)
                 EndpointName = [string](& $readProperty $propertyNames.EndpointName)
                 DeviceInstanceId = [string](& $readProperty $propertyNames.DeviceInstanceId)
@@ -222,6 +225,14 @@ function Get-WindowsAudioEndpointVolume {
         muted = [bool]$state.Muted
         fixed = [Math]::Abs([double]$state.MaximumDecibels - [double]$state.MinimumDecibels) -lt 0.0001
     }
+}
+
+function Get-WindowsAudioEndpointStableId {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$EndpointId)
+
+    Initialize-AudioInterop
+    [DSNTools.WindowsAudioProfile.CoreAudio]::GetStableId($EndpointId)
 }
 
 function Get-WindowsAudioDefaultEndpoint {
@@ -476,7 +487,8 @@ function Assert-AudioRawProfileContract {
         $match = $device['match']
         Assert-AudioRawString -Object $match -Name 'flow' -Context "Device '$key' match" -Required
         if ([string]$match['flow'] -notin @('render','capture')) { throw "Device '$key' match.flow must be render or capture." }
-        foreach ($name in @('endpointId','containerId','deviceInstanceId','driverProvider','driverIdentity')) { Assert-AudioRawString -Object $match -Name $name -Context "Device '$key' match" }
+        foreach ($name in @('endpointId','stableId','containerId','deviceInstanceId','driverProvider','driverIdentity')) { Assert-AudioRawString -Object $match -Name $name -Context "Device '$key' match" }
+        if ($match.ContainsKey('stableId') -and [string]::IsNullOrWhiteSpace([string]$match['stableId'])) { throw "Device '$key' match.stableId must be a non-empty JSON string." }
         if ($match.ContainsKey('endpointId') -and [string]$match['endpointId'] -notmatch '^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$') { throw "Device '$key' match.endpointId must be a braced GUID." }
         if ($match.ContainsKey('hardwareIds')) {
             $hardwareIds = $match['hardwareIds']
@@ -662,7 +674,7 @@ function Assert-AudioProfileShape {
     foreach ($device in @(Get-AudioObjectProperty $Document 'devices')) {
         $key = [string](Get-AudioObjectProperty $device 'key')
         Assert-AudioAllowedProperties -Object $device -Allowed @('key','required','match','settings') -Context "device '$key'"
-        Assert-AudioAllowedProperties -Object (Get-AudioObjectProperty $device 'match') -Allowed @('flow','endpointId','containerId','deviceInstanceId','hardwareIds','driverProvider','driverIdentity') -Context "device '$key' match"
+        Assert-AudioAllowedProperties -Object (Get-AudioObjectProperty $device 'match') -Allowed @('flow','endpointId','stableId','containerId','deviceInstanceId','hardwareIds','driverProvider','driverIdentity') -Context "device '$key' match"
         $settings = Get-AudioObjectProperty $device 'settings'
         Assert-AudioAllowedProperties -Object $settings -Allowed @('name','icon','enabled','volume','format') -Context "device '$key' settings"
         Assert-AudioAllowedProperties -Object (Get-AudioObjectProperty $settings 'volume') -Allowed @('percent','decibels','muted') -Context "device '$key' volume"
@@ -778,12 +790,17 @@ function Test-AudioEndpointFingerprint {
     param(
         [Parameter(Mandatory)]$Endpoint,
         [Parameter(Mandatory)]$Match,
-        [switch]$IgnoreEndpointId
+        [switch]$IgnoreEndpointId,
+        [switch]$IgnoreStableId
     )
 
     if (-not (Test-AudioIdentityValueEqual -Actual $Endpoint.Flow -Expected $Match.flow)) { return $false }
     if (-not $IgnoreEndpointId -and (Test-AudioObjectProperty -Object $Match -Name 'endpointId')) {
         if (-not (Test-AudioIdentityValueEqual -Actual $Endpoint.EndpointId -Expected $Match.endpointId)) { return $false }
+    }
+    if (-not $IgnoreStableId -and (Test-AudioObjectProperty -Object $Match -Name 'stableId')) {
+        $actualStableId = [string](Get-AudioObjectProperty -Object $Endpoint -Name 'StableId')
+        if (-not [string]::Equals($actualStableId, [string]$Match.stableId, [StringComparison]::Ordinal)) { return $false }
     }
 
     foreach ($name in @('containerId', 'deviceInstanceId', 'driverProvider', 'driverIdentity')) {
@@ -867,6 +884,7 @@ function New-AudioProfileDocument {
             endpointId = $endpoint.EndpointId
         }
         foreach ($pair in @(
+            @('stableId', (Get-AudioObjectProperty -Object $endpoint -Name 'StableId')),
             @('containerId', $endpoint.ContainerId),
             @('deviceInstanceId', $endpoint.DeviceInstanceId),
             @('hardwareIds', @($endpoint.HardwareIds)),
@@ -1345,9 +1363,25 @@ function Resolve-AudioProfileDevices {
         }
         if ($exact.Count -gt 1) { throw "Device '$key' matched $($exact.Count) endpoints by endpointId." }
 
+        $stableId = Get-AudioObjectProperty -Object $match -Name 'stableId'
+        if (-not [string]::IsNullOrWhiteSpace([string]$stableId)) {
+            $stableIdMatches = @($flowCandidates | Where-Object {
+                [string]::Equals(
+                    [string](Get-AudioObjectProperty -Object $_ -Name 'StableId'),
+                    [string]$stableId,
+                    [StringComparison]::Ordinal
+                )
+            })
+            if ($stableIdMatches.Count -eq 1) {
+                $resolved[$key] = $stableIdMatches[0]
+                continue
+            }
+            if ($stableIdMatches.Count -gt 1) { throw "Device '$key' matched $($stableIdMatches.Count) endpoints by stableId." }
+        }
+
         $strongCount = Get-AudioStrongFingerprintCount -Match $match
         $stable = @(if ($strongCount -ge 2) {
-            $flowCandidates | Where-Object { Test-AudioEndpointFingerprint -Endpoint $_ -Match $match -IgnoreEndpointId }
+            $flowCandidates | Where-Object { Test-AudioEndpointFingerprint -Endpoint $_ -Match $match -IgnoreEndpointId -IgnoreStableId }
         })
 
         if ($stable.Count -eq 1) {
