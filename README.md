@@ -15,3 +15,7 @@ Small tools for recurring system and desktop tasks.
 | [MSStore EXE Launcher](MSStore_EXE_Launcher/README.md) | Windows | Builds EXE launchers for packaged apps, with optional desktop and tray modes |
 
 Each directory is self-contained. Use its README for requirements, configuration, commands, and limitations.
+
+## License
+
+[MIT](LICENSE) — Copyright (c) 2026 Constantine Travkin.

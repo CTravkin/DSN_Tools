@@ -15,3 +15,7 @@
 | [MSStore EXE Launcher](MSStore_EXE_Launcher/README.ru.md) | Windows | Собирает EXE-лаунчеры пакетных приложений и дополнительные desktop- и tray-варианты |
 
 Каждая директория самодостаточна. Требования, конфигурация, команды и ограничения описаны в ее README.
+
+## Лицензия
+
+[MIT](LICENSE) — Copyright (c) 2026 Constantine Travkin.
