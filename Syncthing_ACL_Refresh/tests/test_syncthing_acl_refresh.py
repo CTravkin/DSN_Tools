@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import itertools
 import os
 import shutil
 import socket
 import ssl
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -58,7 +60,7 @@ def available_acl_test_users() -> tuple[str, ...]:
     configured = os.environ.get("ACL_TEST_USERS", "")
     candidates = [item.strip() for item in configured.split(",") if item.strip()]
     if not candidates:
-        candidates = [pwd.getpwuid(os.geteuid()).pw_name, "nobody", "daemon"]
+        candidates = ["nobody", "daemon"]
     users: list[str] = []
     for candidate in candidates:
         try:
@@ -104,6 +106,17 @@ def runtime_environment(**overrides: str) -> dict[str, str]:
 
 
 class RuntimeSettingsTests(unittest.TestCase):
+    def test_recursive_readonly_settings_and_cli_override(self) -> None:
+        first, second = Path(tempfile.gettempdir()) / "tree", Path(tempfile.gettempdir()) / "other"
+        settings = module.parse_runtime_settings([], runtime_environment(ACL_READONLY_TREES=f"{first},{first}"))
+        self.assertEqual((first,), getattr(settings, "readonly_trees", ()))
+        settings = module.parse_runtime_settings(
+            ["--readonly-trees", os.fspath(second)], runtime_environment(ACL_READONLY_TREES=os.fspath(first)),
+        )
+        self.assertEqual((second,), settings.readonly_trees)
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            module.parse_runtime_settings([], runtime_environment(ACL_READONLY_TREES="relative"))
+
     def test_readonly_directories_are_optional_and_cli_overrides_environment(self) -> None:
         base = Path(tempfile.gettempdir())
         first, second = base / "shared", base / "shared" / "boundary"
@@ -174,6 +187,28 @@ class RuntimeSettingsTests(unittest.TestCase):
 
 
 class ReadonlyDirectoryPolicyTests(unittest.TestCase):
+    def test_recursive_readonly_policy_preserves_ignores_and_exact_boundaries(self) -> None:
+        root = Path(tempfile.gettempdir()) / "tree"
+        matcher = module.IgnoreMatcher(["excluded"])
+        with mock.patch.object(module, "READONLY_TREES", frozenset({root / "backup"}), create=True):
+            self.assertEqual("READ_ONLY_TREE_DIRECTORY", module.desired_for_matcher(root / "backup", root, matcher, True).name)
+            self.assertEqual("READ_ONLY_FILE", module.desired_for_matcher(root / "backup/nested/key", root, matcher, False).name)
+            self.assertEqual(module.AccessLevel.FULL, module.desired_for_matcher(root / "backup-other/key", root, matcher, False))
+        with mock.patch.object(module, "READONLY_TREES", frozenset({root}), create=True):
+            self.assertEqual("READ_ONLY_TREE_DIRECTORY", module.desired_for_matcher(root, root, matcher, True).name)
+            self.assertEqual(module.AccessLevel.NONE, module.desired_for_matcher(root / "excluded", root, matcher, False))
+            self.assertEqual(module.AccessLevel.NONE, module.desired_for_matcher(root / ".stignore", root, matcher, False))
+            traversal = module.IgnoreMatcher(["!nested/file", "*"])
+            self.assertEqual(module.AccessLevel.TRAVERSE, module.desired_for_matcher(root / "nested", root, traversal, True))
+
+    def test_recursive_readonly_tree_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for tree in (root / "missing", root.parent):
+                with self.subTest(tree=tree), mock.patch.object(module, "READONLY_TREES", frozenset({tree}), create=True):
+                    with self.assertRaises(ValueError):
+                        module.validate_readonly_directories([module.FolderConfiguration("shared", root)])
+
     def test_exact_directory_override_preserves_child_and_ignore_policies(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -251,6 +286,40 @@ class FolderAllowlistTests(unittest.TestCase):
 
 
 class IgnoreMatcherTests(unittest.TestCase):
+    def test_invalid_or_incomplete_ignore_responses_fail_closed(self) -> None:
+        gui = module.GuiConfiguration("https://127.0.0.1:8384", "not-used", Path("/unused"))
+        cases = (
+            {}, {"ignore": ["*"]}, {"expanded": []},
+            {"ignore": ["*"], "expanded": []}, {"ignore": ["*"], "expanded": None},
+            {"ignore": 0, "expanded": []}, {"ignore": [], "expanded": [None]},
+            {"ignore": [], "expanded": [""]},
+            {"ignore": [], "expanded": [], "error": "invalid pattern"},
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            for payload in cases:
+                with self.subTest(payload=payload), mock.patch.object(module, "api_json", return_value=payload):
+                    with self.assertRaises(ValueError):
+                        module.read_ignore_matcher(gui, "shared", Path(temporary))
+
+    def test_empty_include_is_valid_but_missing_expansion_of_real_rules_is_rejected(self) -> None:
+        gui = module.GuiConfiguration("https://127.0.0.1:8384", "not-used", Path("/unused"))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".stignore").write_text("#include rules.txt\n", encoding="utf-8")
+            rules = root / "rules.txt"
+            rules.write_text("// comments only\n\n", encoding="utf-8")
+            payload = {"ignore": ["#include rules.txt"], "expanded": []}
+            with mock.patch.object(module, "api_json", return_value=payload):
+                self.assertTrue(module.read_ignore_matcher(gui, "shared", root).is_included("file"))
+                rules.write_text("secret\n", encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    module.read_ignore_matcher(gui, "shared", root)
+                (root / ".stignore").unlink()
+                with self.assertRaises(ValueError):
+                    module.read_ignore_matcher(gui, "shared", root)
+                rules.write_text("// comments only\n", encoding="utf-8")
+                self.assertTrue(module.read_ignore_matcher(gui, "shared", root).is_included("file"))
+
     def test_empty_ignore_response_is_treated_as_no_patterns(self) -> None:
         gui = module.GuiConfiguration(
             url="https://127.0.0.1:8384",
@@ -528,6 +597,151 @@ class AclReconciliationTests(unittest.TestCase):
 
     def acl_entry(self, user: str, permissions: str) -> str:
         return f"user:{user}:{permissions}"
+
+    def test_revoke_preserves_administrator_changes_to_default_base_entries(self) -> None:
+        for revoke_all, specification in itertools.product(
+            (False, True), ("d:g::r-x", "d:o::r--", "d:u::rw-", "d:g::r-x,d:o::r--", "d:m::r--", "d:m::r-x"),
+        ):
+            with self.subTest(revoke_all=revoke_all, specification=specification), tempfile.TemporaryDirectory() as temporary:
+                base, root = Path(temporary), Path(temporary) / "share"
+                child = root / "child"
+                child.mkdir(parents=True, mode=0o700)
+                state = module.StateStore(base / "state/state.sqlite3")
+                self.assertEqual(0, module.reconcile_root(root, module.IgnoreMatcher([]), state).failed)
+                self.assertTrue(state.get(child).created_default_acl)
+                subprocess.run(("setfacl", "-n", "-m", specification, "--", os.fspath(child)), check=True)
+                before = {entry for entry in get_acl(child) if entry.startswith("default:")}
+                if revoke_all:
+                    stats = module.ReconcileStats()
+                    module.reconcile_removed_state(state, [], stats, force=True)
+                    self.assertEqual(0, stats.failed)
+                else:
+                    self.assertEqual(0, module.reconcile_root(root, module.IgnoreMatcher(["child"]), state).failed)
+                expected = before - {f"default:user:{user}:rwx" for user in ACL_TEST_USERS}
+                self.assertEqual(expected, {entry for entry in get_acl(child) if entry.startswith("default:")})
+                state.close()
+
+    def test_scaffold_cleanup_requires_unchanged_mask_and_known_previous_policy(self) -> None:
+        for access in (
+            module.AccessLevel.FULL, module.AccessLevel.READ_ONLY_DIRECTORY,
+            module.AccessLevel.READ_ONLY_TREE_DIRECTORY, module.AccessLevel.TRAVERSE,
+        ):
+            with self.subTest(access=access), tempfile.TemporaryDirectory() as temporary:
+                base, root = Path(temporary), Path(temporary) / "share"
+                child = root / "child"
+                child.mkdir(parents=True, mode=0o700)
+                state = module.StateStore(base / "state/state.sqlite3")
+                self.assertEqual(0, module.reconcile_path(
+                    child, module.AccessLevel.FULL, state, force=True, allowed_roots=[root],
+                ).failed)
+                self.assertEqual(0, module.reconcile_path(
+                    child, access, state, force=True, allowed_roots=[root],
+                ).failed)
+                before = {entry for entry in get_acl(child) if entry.startswith("default:")}
+                self.assertEqual(0, module.reconcile_path(
+                    child, module.AccessLevel.NONE, state, force=True, allowed_roots=[root],
+                ).failed)
+                remaining = {entry for entry in get_acl(child) if entry.startswith("default:")}
+                self.assertEqual(before if access is module.AccessLevel.TRAVERSE else set(), remaining)
+                state.close()
+
+    def test_recursive_readonly_preserves_owner_and_base_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            base.chmod(0o755)
+            root = base / "private-home"
+            ssh = root / ".ssh"
+            ssh.mkdir(parents=True, mode=0o700)
+            root.chmod(0o700)
+            key = ssh / "authorized_keys"
+            key.write_text("fixture", encoding="utf-8")
+            key.chmod(0o600)
+            excluded = root / "excluded"
+            excluded.write_text("excluded", encoding="utf-8")
+            excluded.chmod(0o600)
+            originals = {path: (path.stat().st_uid, path.stat().st_gid, path.stat().st_mode & 0o707) for path in (root, ssh, key)}
+            state = module.StateStore(base / "state/state.sqlite3")
+            matcher = module.IgnoreMatcher(["excluded"])
+            with mock.patch.object(module, "READONLY_TREES", frozenset({root}), create=True):
+                stats = module.reconcile_root(root, matcher, state)
+                self.assertEqual(0, stats.failed)
+                observer = ACL_TEST_USERS[0]
+                for path in (root, ssh, key):
+                    with self.subTest(path=path):
+                        self.assertEqual(0, path.stat().st_mode & 0o022)
+                        self.assertEqual(originals[path], (path.stat().st_uid, path.stat().st_gid, path.stat().st_mode & 0o707))
+                        for user in ACL_TEST_USERS:
+                            self.assertIn(self.acl_entry(user, "r-x" if path.is_dir() else "r--"), get_acl(path))
+                        self.assertEqual(1, subprocess.run(("runuser", "-u", observer, "--", "test", "-w", os.fspath(path))).returncode)
+                self.assertEqual(0, subprocess.run(("runuser", "-u", observer, "--", "cat", os.fspath(key)), stdout=subprocess.DEVNULL).returncode)
+                self.assertEqual(1, subprocess.run(("runuser", "-u", observer, "--", "test", "-r", os.fspath(excluded))).returncode)
+                inherited = ssh / "new-key"
+                inherited.write_text("new", encoding="utf-8")
+                self.assertEqual(0, subprocess.run(("runuser", "-u", observer, "--", "test", "-r", os.fspath(inherited))).returncode)
+                self.assertEqual(1, subprocess.run(("runuser", "-u", observer, "--", "test", "-w", os.fspath(inherited))).returncode)
+                state.close()
+
+    def test_recursive_readonly_switch_reconciles_cache_defaults_and_chmod_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base, root = Path(temporary), Path(temporary) / "shared"
+            root.mkdir(mode=0o700)
+            child = root / "file"
+            child.write_text("fixture", encoding="utf-8")
+            child.chmod(0o600)
+            state = module.StateStore(base / "state/state.sqlite3")
+            matcher = module.IgnoreMatcher([])
+            self.assertEqual(0, module.reconcile_root(root, matcher, state).failed)
+            with mock.patch.object(module, "READONLY_TREES", frozenset({root}), create=True):
+                stats = module.reconcile_root(root, matcher, state)
+                self.assertEqual(0, stats.failed)
+                self.assertGreater(stats.changed, 0)
+                for user in ACL_TEST_USERS:
+                    self.assertIn(f"default:user:{user}:r-x", get_acl(root))
+                    self.assertIn(self.acl_entry(user, "r--"), get_acl(child))
+                self.assertEqual(0, module.reconcile_root(root, matcher, state).acl_reads)
+                child.chmod(0o600)
+                self.assertGreater(module.reconcile_root(root, matcher, state).changed, 0)
+            self.assertEqual(0, module.reconcile_root(root, matcher, state).failed)
+            for user in ACL_TEST_USERS:
+                self.assertIn(f"default:user:{user}:rwx", get_acl(root))
+                self.assertIn(self.acl_entry(user, "rw-"), get_acl(child))
+            state.close()
+
+    def test_recursive_readonly_preserves_unmanaged_writers_and_default_rights(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            base, root = Path(temporary), Path(temporary) / "shared"
+            root.mkdir(mode=0o700)
+            subprocess.run(("setfacl", "-n", "-m", f"u:{ACL_TEST_UNMANAGED_USER}:rwx,m::rwx,d:u::rwx,d:g::---,d:o::---,d:u:{ACL_TEST_UNMANAGED_USER}:rwx,d:m::rwx", "--", os.fspath(root)), check=True)
+            state = module.StateStore(base / "state/state.sqlite3")
+            with mock.patch.object(module, "READONLY_TREES", frozenset({root}), create=True):
+                self.assertEqual(0, module.reconcile_root(root, module.IgnoreMatcher([]), state).failed)
+            entries = get_acl(root)
+            self.assertIn(f"user:{ACL_TEST_UNMANAGED_USER}:rwx", entries)
+            self.assertIn(f"default:user:{ACL_TEST_UNMANAGED_USER}:rwx", entries)
+            for user in ACL_TEST_USERS:
+                self.assertIn(self.acl_entry(user, "r-x"), entries)
+                self.assertIn(f"default:user:{user}:r-x", entries)
+            state.close()
+
+    def test_owner_policy_conflicts_do_not_mutate_acl_for_ro_or_rw(self) -> None:
+        cases = ((True, 0o600, "file"), (False, 0o400, "file"), (True, 0o700, "directory"), (False, 0o500, "directory"))
+        for readonly, mode, kind in cases:
+            with self.subTest(readonly=readonly, kind=kind), tempfile.TemporaryDirectory() as temporary:
+                base, root = Path(temporary), Path(temporary) / "shared"
+                root.mkdir(mode=0o700)
+                path = root / "target"
+                if kind == "directory":
+                    path.mkdir()
+                else:
+                    path.write_text("fixture", encoding="utf-8")
+                owner = pwd.getpwnam(ACL_TEST_USERS[0])
+                os.chown(path, owner.pw_uid, owner.pw_gid)
+                path.chmod(mode)
+                before = get_acl(path)
+                with mock.patch.object(module, "READONLY_TREES", frozenset({root}) if readonly else frozenset(), create=True):
+                    desired = module.desired_for_matcher(path, root, module.IgnoreMatcher([]), kind == "directory")
+                    self.assertEqual(module.AclOutcome.FAILED, module.set_managed_access(path, desired))
+                self.assertEqual(before, get_acl(path))
 
     def test_readonly_directory_keeps_safe_mode_and_writable_children(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -967,6 +1181,67 @@ class AclReconciliationTests(unittest.TestCase):
 
 
 class StateMigrationTests(unittest.TestCase):
+    def test_future_legacy_policy_is_rejected_before_schema_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "state.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute("CREATE TABLE paths (path TEXT PRIMARY KEY, ctime_ns INTEGER, desired INTEGER, anchor TEXT, anchor_dev INTEGER, anchor_ino INTEGER)")
+            connection.execute("INSERT INTO paths VALUES ('sentinel',123,1,'/share',1,2)")
+            connection.execute("PRAGMA user_version=999")
+            connection.commit()
+            connection.close()
+            with self.assertRaisesRegex(ValueError, "policy version"):
+                module.StateStore(database)
+            connection = sqlite3.connect(database)
+            try:
+                self.assertIn("desired", {row[1] for row in connection.execute("PRAGMA table_info(paths)")})
+                self.assertEqual(123, connection.execute("SELECT ctime_ns FROM paths").fetchone()[0])
+                self.assertEqual(999, connection.execute("PRAGMA user_version").fetchone()[0])
+            finally:
+                connection.close()
+
+    def test_policy_upgrade_invalidates_only_cache_and_preserves_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "state/state.sqlite3"
+            store = module.StateStore(database)
+            store.connection.execute("INSERT INTO paths VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                     (os.fspath(Path("/share/file")), 123, 2, "/share", 1, 2, "alice", 1))
+            store.connection.execute("PRAGMA user_version=0")
+            store.commit()
+            store.close()
+            store = module.StateStore(database)
+            record = store.get(Path("/share/file"))
+            store.close()
+            self.assertIsNotNone(record)
+            self.assertEqual(-1, record.ctime_ns)
+            self.assertEqual(("alice",), record.users)
+            self.assertTrue(record.created_default_acl)
+            store = module.StateStore(database)
+            store.connection.execute("UPDATE paths SET ctime_ns=456")
+            store.commit()
+            store.close()
+            store = module.StateStore(database)
+            self.assertEqual(456, store.get(Path("/share/file")).ctime_ns)
+            store.close()
+
+    def test_future_policy_version_is_rejected_without_discarding_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            database = Path(temporary) / "state/state.sqlite3"
+            store = module.StateStore(database)
+            store.connection.execute("INSERT INTO paths VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                                     (os.fspath(Path("/share/file")), 123, 2, "/share", 1, 2, "alice", 1))
+            store.connection.execute("PRAGMA user_version=999")
+            store.commit()
+            store.close()
+            with self.assertRaisesRegex(ValueError, "policy version"):
+                reopened = module.StateStore(database)
+                reopened.close()
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(123, connection.execute("SELECT ctime_ns FROM paths").fetchone()[0])
+            finally:
+                connection.close()
+
     def test_legacy_state_is_migrated_without_losing_revoke_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "state.sqlite3"
