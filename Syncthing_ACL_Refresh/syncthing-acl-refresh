@@ -868,18 +868,18 @@ def _set_managed_target_access(
 
         current_users = set(ACL_USERS)
         removable_users = current_users | set(previous_users)
-        removals: list[str] = []
+        removals: dict[str, str] = {}
         for user in removable_users:
             if (access is AccessLevel.NONE or user not in current_users) and f"user:{user}:" in entries:
-                removals.append(f"u:{user}")
+                removals[f"user:{user}:"] = f"u:{user}"
             if directory and (not full_directory or user not in current_users) and f"default:user:{user}:" in entries:
-                removals.append(f"d:u:{user}")
+                removals[f"default:user:{user}:"] = f"d:u:{user}"
         changed = bool(removals)
-        if removals:
-            run_setfacl(target, ["-n", "-x", ",".join(removals)])
-            entries = acl_entries(target)
 
         if access is AccessLevel.NONE:
+            if removals:
+                run_setfacl(target, ["-n", "-x", ",".join(removals.values())])
+                entries = acl_entries(target)
             if directory and created_default_acl:
                 remaining_default_named = any(
                     key.startswith("default:user:") and key != "default:user::"
@@ -895,6 +895,8 @@ def _set_managed_target_access(
                 return AclOutcome.CHANGED
             return AclOutcome.UNCHANGED
 
+        # Validate the post-removal ACL before changing access or default entries.
+        entries = {key: permissions for key, permissions in entries.items() if key not in removals}
         old_mask = entries.get("mask::", entries.get("group::", 0))
         desired_access = (
             5 if access is AccessLevel.TRAVERSE
@@ -924,6 +926,8 @@ def _set_managed_target_access(
                 + ",".join(conflicts)
             )
             return AclOutcome.FAILED
+        if removals:
+            run_setfacl(target, ["-n", "-x", ",".join(removals.values())])
         access_ok = all(
             entries.get(f"user:{user}:", 0) == desired_access
             and (entries[f"user:{user}:"] & old_mask) == desired_access

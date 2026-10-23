@@ -798,6 +798,60 @@ class AclReconciliationTests(unittest.TestCase):
             self.assertIn("group::---", child_entries)
             self.assertIn("other::---", child_entries)
 
+    def test_guard_rejection_preserves_access_and_default_acl_before_retiring_users(self) -> None:
+        cases = (
+            (module.AccessLevel.TRAVERSE, "r--", "--x", None),
+            (module.AccessLevel.FULL, "rwx", "r--", None),
+            (module.AccessLevel.READ_ONLY_DIRECTORY, "rw-", "rw-", None),
+            (module.AccessLevel.FULL, "---", "rwx", "r--"),
+        )
+        for access, raw_permissions, mask, default_mask in cases:
+            with self.subTest(access=access, default_mask=default_mask), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "shared"
+                path.mkdir(mode=0o700)
+                specifications = ["g::---", "o::---", "d:u::rwx", "d:g::---", "d:o::---", "d:m::rwx"]
+                for user in ACL_TEST_USERS:
+                    specifications.extend((f"u:{user}:rwx", f"d:u:{user}:rwx"))
+                specifications.extend((f"u:{ACL_TEST_UNMANAGED_USER}:{raw_permissions}", f"m::{mask}"))
+                if default_mask is not None:
+                    specifications.extend((f"d:u:{ACL_TEST_UNMANAGED_USER}:rw-", f"d:m::{default_mask}"))
+                subprocess.run(
+                    ("setfacl", "-n", "-m", ",".join(specifications), "--", os.fspath(path)),
+                    check=True,
+                )
+                before = subprocess.run(
+                    ("getfacl", "-cp", "--", os.fspath(path)), capture_output=True, check=True,
+                ).stdout
+
+                with mock.patch.object(module, "ACL_USERS", (ACL_TEST_USERS[0],)):
+                    outcome = module.set_managed_access(path, access, previous_users=ACL_TEST_USERS)
+
+                self.assertEqual(module.AclOutcome.FAILED, outcome)
+                after = subprocess.run(
+                    ("getfacl", "-cp", "--", os.fspath(path)), capture_output=True, check=True,
+                ).stdout
+                self.assertEqual(before, after)
+
+    def test_retired_masked_user_is_not_treated_as_an_unmanaged_mask_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "file.txt"
+            path.write_text("fixture", encoding="utf-8")
+            path.chmod(0o600)
+            current_user, retired_user = ACL_TEST_USERS
+            subprocess.run(
+                ("setfacl", "-n", "-m", f"u:{retired_user}:rw-,m::---", "--", os.fspath(path)),
+                check=True,
+            )
+            with mock.patch.object(module, "ACL_USERS", (current_user,)):
+                outcome = module.set_managed_access(
+                    path, module.AccessLevel.FULL, previous_users=(retired_user,),
+                )
+
+            self.assertEqual(module.AclOutcome.CHANGED, outcome)
+            entries = get_acl(path)
+            self.assertIn(self.acl_entry(current_user, "rw-"), entries)
+            self.assertFalse(any(item.startswith(f"user:{retired_user}:") for item in entries))
+
     def test_mask_conflict_fails_without_expanding_unmanaged_effective_rights(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "conflict.txt"
