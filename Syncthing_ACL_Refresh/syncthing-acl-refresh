@@ -33,6 +33,7 @@ STATE_PATH = Path("/var/lib/syncthing-acl-refresh/state.sqlite3")
 PINNED_CERTIFICATE_PATH = Path("/etc/syncthing-acl-refresh/https-cert.pem")
 CONFIG_PATH: Path | None = None
 ALLOWLIST_PATH = Path("/etc/syncthing-acl-refresh/folders.conf")
+READONLY_DIRECTORIES: frozenset[Path] = frozenset()
 PERMISSION_BITS = {"r": 4, "w": 2, "x": 1}
 
 
@@ -46,6 +47,7 @@ class RuntimeSettings:
     allowlist_path: Path
     force: bool
     revoke_all: bool
+    readonly_directories: tuple[Path, ...] = ()
 
 
 def _absolute_path(value: str, variable: str) -> Path:
@@ -68,6 +70,16 @@ def _managed_users(value: str) -> tuple[str, ...]:
     if not users:
         raise ValueError("At least one managed ACL user is required")
     return tuple(users)
+
+
+def _readonly_directories(value: str) -> tuple[Path, ...]:
+    paths: list[Path] = []
+    for item in value.split(","):
+        if item.strip():
+            path = Path(os.path.abspath(_absolute_path(item.strip(), "readonly directory")))
+            if path not in paths:
+                paths.append(path)
+    return tuple(paths)
 
 
 def read_environment_file(path: Path) -> dict[str, str]:
@@ -106,6 +118,8 @@ def parse_runtime_settings(
     parser.add_argument("--state", default=env.get("STATE_PATH", "/var/lib/syncthing-acl-refresh/state.sqlite3"))
     parser.add_argument("--certificate", default=env.get("TLS_CERTIFICATE", "/etc/syncthing-acl-refresh/https-cert.pem"))
     parser.add_argument("--allowlist", default=env.get("FOLDER_ALLOWLIST", "/etc/syncthing-acl-refresh/folders.conf"))
+    parser.add_argument("--readonly-directories", default=env.get("ACL_READONLY_DIRECTORIES", ""),
+                        help="comma-separated absolute directories with read/search access only")
     parser.add_argument("--force", action="store_true", help="inspect ACLs even when cached metadata is unchanged")
     parser.add_argument("--revoke-all", action="store_true", help="remove ACL entries recorded in state and exit")
     parsed = parser.parse_args(arguments)
@@ -121,18 +135,20 @@ def parse_runtime_settings(
         allowlist_path=_absolute_path(parsed.allowlist, "allowlist"),
         force=parsed.force,
         revoke_all=parsed.revoke_all,
+        readonly_directories=_readonly_directories(parsed.readonly_directories),
     )
 
 
 def apply_runtime_settings(settings: RuntimeSettings) -> None:
     global SYNCTHING_USER, ACL_USERS, CONFIG_PATH, STATE_PATH, ALLOWLIST_PATH
-    global PINNED_CERTIFICATE_PATH
+    global PINNED_CERTIFICATE_PATH, READONLY_DIRECTORIES
     SYNCTHING_USER = settings.syncthing_user
     ACL_USERS = settings.acl_users
     CONFIG_PATH = settings.config_path
     STATE_PATH = settings.state_path
     PINNED_CERTIFICATE_PATH = settings.certificate_path
     ALLOWLIST_PATH = settings.allowlist_path
+    READONLY_DIRECTORIES = frozenset(settings.readonly_directories)
 
 
 class UnsafePathError(Exception):
@@ -150,6 +166,7 @@ class AccessLevel(Enum):
     NONE = 0
     TRAVERSE = 1
     FULL = 2
+    READ_ONLY_DIRECTORY = 3
 
 
 def log(message: str) -> None:
@@ -641,9 +658,18 @@ class FolderPolicy:
     matcher: IgnoreMatcher
 
 
+def validate_readonly_directories(folders: list[FolderConfiguration]) -> None:
+    for path in READONLY_DIRECTORIES:
+        if not any(path == folder.path or path.is_relative_to(folder.path) for folder in folders):
+            raise ValueError(f"Readonly directory is outside every managed folder: {path}")
+        if Path(os.path.realpath(path)) != path or not path.is_dir():
+            raise ValueError(f"Readonly directory must exist without symbolic links: {path}")
+
+
 def load_policies(config_path: Path, home: Path) -> list[FolderPolicy]:
     gui, folders = read_configuration(config_path, home)
     folders = require_allowed_folders(folders, load_folder_allowlist(ALLOWLIST_PATH))
+    validate_readonly_directories(folders)
     return [
         FolderPolicy(folder.folder_id, folder.path, read_ignore_matcher(gui, folder.folder_id, folder.path))
         for folder in folders
@@ -835,21 +861,25 @@ def _set_managed_target_access(
             access = AccessLevel.NONE
         if access is AccessLevel.TRAVERSE and not directory:
             access = AccessLevel.NONE
+        if access is AccessLevel.READ_ONLY_DIRECTORY and not directory:
+            log(f"Readonly directory policy requires a directory: {target.display_path}")
+            return AclOutcome.FAILED
+        full_directory = directory and access in {AccessLevel.FULL, AccessLevel.READ_ONLY_DIRECTORY}
 
         current_users = set(ACL_USERS)
         removable_users = current_users | set(previous_users)
-        removals: list[str] = []
+        removals: dict[str, str] = {}
         for user in removable_users:
             if (access is AccessLevel.NONE or user not in current_users) and f"user:{user}:" in entries:
-                removals.append(f"u:{user}")
-            if directory and (access is not AccessLevel.FULL or user not in current_users) and f"default:user:{user}:" in entries:
-                removals.append(f"d:u:{user}")
+                removals[f"user:{user}:"] = f"u:{user}"
+            if directory and (not full_directory or user not in current_users) and f"default:user:{user}:" in entries:
+                removals[f"default:user:{user}:"] = f"d:u:{user}"
         changed = bool(removals)
-        if removals:
-            run_setfacl(target, ["-n", "-x", ",".join(removals)])
-            entries = acl_entries(target)
 
         if access is AccessLevel.NONE:
+            if removals:
+                run_setfacl(target, ["-n", "-x", ",".join(removals.values())])
+                entries = acl_entries(target)
             if directory and created_default_acl:
                 remaining_default_named = any(
                     key.startswith("default:user:") and key != "default:user::"
@@ -865,18 +895,30 @@ def _set_managed_target_access(
                 return AclOutcome.CHANGED
             return AclOutcome.UNCHANGED
 
+        # Validate the post-removal ACL before changing access or default entries.
+        entries = {key: permissions for key, permissions in entries.items() if key not in removals}
         old_mask = entries.get("mask::", entries.get("group::", 0))
         desired_access = (
-            1 if access is AccessLevel.TRAVERSE
+            5 if access is AccessLevel.TRAVERSE
+            else 5 if access is AccessLevel.READ_ONLY_DIRECTORY
             else 7 if directory or has_unmanaged_execute(entries, old_mask)
             else 6
         )
         new_mask = old_mask | desired_access
+        if access is AccessLevel.READ_ONLY_DIRECTORY:
+            writers = unmanaged_mask_conflicts(entries, "", old_mask & ~2, old_mask)
+            if entries.get("other::", 0) & 2:
+                writers.append("other::")
+            if writers:
+                log(f"Readonly directory conflict for {target.display_path}; unmanaged write access: "
+                    + ",".join(writers))
+                return AclOutcome.FAILED
+            new_mask &= ~2
         conflicts = unmanaged_mask_conflicts(entries, "", old_mask, new_mask)
         default_exists = "default:user::" in entries
         old_default_mask = entries.get("default:mask::", entries.get("default:group::", 0))
         new_default_mask = old_default_mask | 7
-        if directory and access is AccessLevel.FULL and default_exists:
+        if full_directory and default_exists:
             conflicts += unmanaged_mask_conflicts(entries, "default:", old_default_mask, new_default_mask)
         if conflicts:
             log(
@@ -884,21 +926,23 @@ def _set_managed_target_access(
                 + ",".join(conflicts)
             )
             return AclOutcome.FAILED
+        if removals:
+            run_setfacl(target, ["-n", "-x", ",".join(removals.values())])
         access_ok = all(
             entries.get(f"user:{user}:", 0) == desired_access
             and (entries[f"user:{user}:"] & old_mask) == desired_access
             for user in ACL_USERS
         )
-        default_ok = access is not AccessLevel.FULL or not directory or default_exists and all(
+        default_ok = not full_directory or default_exists and all(
             entries.get(f"default:user:{user}:", 0) == 7
             and (entries[f"default:user:{user}:"] & old_default_mask) == 7
             for user in ACL_USERS
         )
-        if access_ok and default_ok:
+        if access_ok and default_ok and old_mask == new_mask:
             return AclOutcome.CHANGED if changed else AclOutcome.UNCHANGED
         specifications = [f"u:{user}:{permission_text(desired_access)}" for user in ACL_USERS]
         specifications.append(f"m::{permission_text(new_mask)}")
-        if directory and access is AccessLevel.FULL:
+        if full_directory:
             if not default_exists:
                 specifications.extend(("d:u::rwx", "d:g::---", "d:o::---"))
                 target.created_default_acl = True
@@ -1184,13 +1228,18 @@ def reconcile_path(
 
 def desired_for_matcher(path: Path, root: Path, matcher: IgnoreMatcher, directory: bool) -> AccessLevel:
     if path == root:
-        return AccessLevel.FULL
-    relative = path.relative_to(root).as_posix()
-    if matcher.is_control_path(relative):
-        return AccessLevel.NONE
-    if directory:
-        return matcher.directory_access(relative)
-    return AccessLevel.FULL if matcher.is_included(relative) else AccessLevel.NONE
+        access = AccessLevel.FULL
+    else:
+        relative = path.relative_to(root).as_posix()
+        if matcher.is_control_path(relative):
+            return AccessLevel.NONE
+        if directory:
+            access = matcher.directory_access(relative)
+        else:
+            access = AccessLevel.FULL if matcher.is_included(relative) else AccessLevel.NONE
+    if directory and access is AccessLevel.FULL and path in READONLY_DIRECTORIES:
+        return AccessLevel.READ_ONLY_DIRECTORY
+    return access
 
 
 def walk_paths(root: Path, stats: ReconcileStats | None = None) -> Iterator[Path]:

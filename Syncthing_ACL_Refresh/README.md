@@ -26,10 +26,15 @@ Copy [`syncthing-acl-refresh.env.example`](syncthing-acl-refresh.env.example) an
 | `STATE_PATH` | no | `/var/lib/syncthing-acl-refresh/state.sqlite3` | Reconciliation and revocation state |
 | `TLS_CERTIFICATE` | no | `/etc/syncthing-acl-refresh/https-cert.pem` | Pinned GUI certificate |
 | `FOLDER_ALLOWLIST` | no | `/etc/syncthing-acl-refresh/folders.conf` | Root-controlled folder allowlist |
+| `ACL_READONLY_DIRECTORIES` | no | empty | Comma-separated absolute directories that receive read/search access without write |
 
 The allowlist format is `folder-id=/absolute/path`, one entry per folder that this utility should manage. The file must be owned by root and not writable by group or others. Each listed ID and path must match Syncthing configuration; unlisted Syncthing folders are ignored. Managed folder paths must not overlap.
 
 CLI options override environment-file values. `--env-file` is intended for direct invocations; systemd loads the installed environment file itself.
+
+`ACL_READONLY_DIRECTORIES` (CLI: `--readonly-directories`) applies only to the exact listed directories, which must exist inside managed folders without symlinks. Managed users receive `r-x`, and the access ACL mask has no write bit. Ignore rules and traversal-only access take precedence over this setting. Descendants follow their normal ignore/access policy; default ACL inheritance remains unchanged. A conflicting unmanaged writer causes an error instead of silently revoking its permissions. The setting is included in reconciliation decisions, so adding or removing it takes effect without `--force`.
+
+Directories needed to reach possible negated matches receive `r-x`: Syncthing's scanner and watcher must list them. This does not grant access to ignored files. Nested negations can require directory listing across the managed tree because Syncthing cannot prune those directories. When upgrading from execute-only traversal, run one full canonical reconciliation with `--force` to refresh cached ACLs; subsequent runs use the normal cache.
 
 Legacy state is migrated with the current `ACL_USERS` value. Revoke recorded ACLs before upgrading if the managed user list also changes.
 
@@ -88,3 +93,4 @@ ACL integration tests require root, two existing users, one additional local acc
 - Hard links share one inode, so changing an in-root link also changes links to that inode elsewhere
 - Existing unrelated default ACLs remain in effect
 - Special files never receive managed access
+- When reverting to an older utility, restore its matching state snapshot; older code cannot read the new directory access level
