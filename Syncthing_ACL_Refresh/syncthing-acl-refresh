@@ -34,6 +34,8 @@ PINNED_CERTIFICATE_PATH = Path("/etc/syncthing-acl-refresh/https-cert.pem")
 CONFIG_PATH: Path | None = None
 ALLOWLIST_PATH = Path("/etc/syncthing-acl-refresh/folders.conf")
 READONLY_DIRECTORIES: frozenset[Path] = frozenset()
+READONLY_TREES: frozenset[Path] = frozenset()
+STATE_POLICY_VERSION = 1
 PERMISSION_BITS = {"r": 4, "w": 2, "x": 1}
 
 
@@ -48,6 +50,7 @@ class RuntimeSettings:
     force: bool
     revoke_all: bool
     readonly_directories: tuple[Path, ...] = ()
+    readonly_trees: tuple[Path, ...] = ()
 
 
 def _absolute_path(value: str, variable: str) -> Path:
@@ -120,6 +123,8 @@ def parse_runtime_settings(
     parser.add_argument("--allowlist", default=env.get("FOLDER_ALLOWLIST", "/etc/syncthing-acl-refresh/folders.conf"))
     parser.add_argument("--readonly-directories", default=env.get("ACL_READONLY_DIRECTORIES", ""),
                         help="comma-separated absolute directories with read/search access only")
+    parser.add_argument("--readonly-trees", default=env.get("ACL_READONLY_TREES", ""),
+                        help="comma-separated absolute trees with read-only managed access")
     parser.add_argument("--force", action="store_true", help="inspect ACLs even when cached metadata is unchanged")
     parser.add_argument("--revoke-all", action="store_true", help="remove ACL entries recorded in state and exit")
     parsed = parser.parse_args(arguments)
@@ -136,12 +141,13 @@ def parse_runtime_settings(
         force=parsed.force,
         revoke_all=parsed.revoke_all,
         readonly_directories=_readonly_directories(parsed.readonly_directories),
+        readonly_trees=_readonly_directories(parsed.readonly_trees),
     )
 
 
 def apply_runtime_settings(settings: RuntimeSettings) -> None:
     global SYNCTHING_USER, ACL_USERS, CONFIG_PATH, STATE_PATH, ALLOWLIST_PATH
-    global PINNED_CERTIFICATE_PATH, READONLY_DIRECTORIES
+    global PINNED_CERTIFICATE_PATH, READONLY_DIRECTORIES, READONLY_TREES
     SYNCTHING_USER = settings.syncthing_user
     ACL_USERS = settings.acl_users
     CONFIG_PATH = settings.config_path
@@ -149,6 +155,7 @@ def apply_runtime_settings(settings: RuntimeSettings) -> None:
     PINNED_CERTIFICATE_PATH = settings.certificate_path
     ALLOWLIST_PATH = settings.allowlist_path
     READONLY_DIRECTORIES = frozenset(settings.readonly_directories)
+    READONLY_TREES = frozenset(settings.readonly_trees)
 
 
 class UnsafePathError(Exception):
@@ -167,6 +174,8 @@ class AccessLevel(Enum):
     TRAVERSE = 1
     FULL = 2
     READ_ONLY_DIRECTORY = 3
+    READ_ONLY_TREE_DIRECTORY = 4
+    READ_ONLY_FILE = 5
 
 
 def log(message: str) -> None:
@@ -510,16 +519,16 @@ def literal_prefix(pattern: str) -> tuple[str, bool]:
 class ControlPaths:
     files: set[str]
     parents: set[str]
+    has_patterns: bool = False
 
 
-def discover_control_paths(root: Path) -> ControlPaths:
+def discover_control_paths(root: Path, raw_patterns: Iterable[str] = ()) -> ControlPaths:
     root = root.resolve()
     files = {".stignore", ".stfolder"}
     parents: set[str] = set()
     first = root / ".stignore"
-    if not first.is_file():
-        return ControlPaths(files, parents)
     visited: set[Path] = set()
+    has_patterns = False
 
     def visit(path: Path) -> None:
         logical = Path(os.path.abspath(path))
@@ -540,15 +549,25 @@ def discover_control_paths(root: Path) -> ControlPaths:
         if resolved in visited:
             return
         visited.add(resolved)
-        for raw_line in resolved.read_text(encoding="utf-8").splitlines():
+        read_lines(logical, resolved.read_text(encoding="utf-8").splitlines())
+
+    def read_lines(path: Path, lines: Iterable[str]) -> None:
+        nonlocal has_patterns
+        for raw_line in lines:
             line = raw_line.strip()
+            if not line or line.startswith("//"):
+                continue
             if line.startswith("#include "):
                 include_name = line[len("#include "):].strip()
                 if include_name:
-                    visit(logical.parent / include_name)
+                    visit(path.parent / include_name)
+            else:
+                has_patterns = True
 
-    visit(first)
-    return ControlPaths(files, parents)
+    if first.is_file():
+        visit(first)
+    read_lines(first, raw_patterns)
+    return ControlPaths(files, parents, has_patterns)
 
 
 class IgnoreMatcher:
@@ -642,13 +661,18 @@ class IgnoreMatcher:
 
 def read_ignore_matcher(gui: GuiConfiguration, folder_id: str, root: Path) -> IgnoreMatcher:
     payload = api_json(gui, "/rest/db/ignores", {"folder": folder_id})
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or "ignore" not in payload or "expanded" not in payload:
         raise ValueError(f"Unexpected ignore response for folder {folder_id}")
-    raw, expanded = payload.get("ignore") or [], payload.get("expanded") or []
-    if not isinstance(raw, list) or not isinstance(expanded, list):
+    raw = [] if payload["ignore"] is None else payload["ignore"]
+    expanded = [] if payload["expanded"] is None else payload["expanded"]
+    if (payload.get("error") or not isinstance(raw, list) or not isinstance(expanded, list)
+            or any(not isinstance(item, str) for item in raw)
+            or any(not isinstance(item, str) or not item.strip() for item in expanded)):
         raise ValueError(f"Invalid ignore response for folder {folder_id}")
-    controls = discover_control_paths(root)
-    return IgnoreMatcher([str(item) for item in expanded], controls.files, controls.parents)
+    controls = discover_control_paths(root, raw)
+    if not expanded and controls.has_patterns:
+        raise ValueError(f"Missing expanded ignore patterns for folder {folder_id}")
+    return IgnoreMatcher(expanded, controls.files, controls.parents)
 
 
 @dataclass(frozen=True)
@@ -659,7 +683,7 @@ class FolderPolicy:
 
 
 def validate_readonly_directories(folders: list[FolderConfiguration]) -> None:
-    for path in READONLY_DIRECTORIES:
+    for path in READONLY_DIRECTORIES | READONLY_TREES:
         if not any(path == folder.path or path.is_relative_to(folder.path) for folder in folders):
             raise ValueError(f"Readonly directory is outside every managed folder: {path}")
         if Path(os.path.realpath(path)) != path or not path.is_dir():
@@ -853,6 +877,7 @@ def _set_managed_target_access(
     access: AccessLevel,
     previous_users: Iterable[str] = (),
     created_default_acl: bool = False,
+    previous_access: AccessLevel | None = None,
 ) -> AclOutcome:
     try:
         entries = acl_entries(target)
@@ -864,7 +889,18 @@ def _set_managed_target_access(
         if access is AccessLevel.READ_ONLY_DIRECTORY and not directory:
             log(f"Readonly directory policy requires a directory: {target.display_path}")
             return AclOutcome.FAILED
-        full_directory = directory and access in {AccessLevel.FULL, AccessLevel.READ_ONLY_DIRECTORY}
+        if access is AccessLevel.READ_ONLY_TREE_DIRECTORY and not directory:
+            log(f"Readonly tree directory policy requires a directory: {target.display_path}")
+            return AclOutcome.FAILED
+        if access is AccessLevel.READ_ONLY_FILE and not regular:
+            log(f"Readonly file policy requires a regular file: {target.display_path}")
+            return AclOutcome.FAILED
+        readonly = access in {
+            AccessLevel.READ_ONLY_DIRECTORY, AccessLevel.READ_ONLY_TREE_DIRECTORY, AccessLevel.READ_ONLY_FILE,
+        }
+        full_directory = directory and access in {
+            AccessLevel.FULL, AccessLevel.READ_ONLY_DIRECTORY, AccessLevel.READ_ONLY_TREE_DIRECTORY,
+        }
 
         current_users = set(ACL_USERS)
         removable_users = current_users | set(previous_users)
@@ -886,7 +922,18 @@ def _set_managed_target_access(
                     or key.startswith("default:group:") and key != "default:group::"
                     for key in entries
                 )
-                if not remaining_default_named and "default:user::" in entries:
+                recorded_default_mask = {
+                    AccessLevel.FULL: 7, AccessLevel.READ_ONLY_DIRECTORY: 7,
+                    AccessLevel.READ_ONLY_TREE_DIRECTORY: 5,
+                }.get(previous_access)
+                original_default_base = recorded_default_mask is not None and all(
+                    entries.get(key) == permissions
+                    for key, permissions in (
+                        ("default:user::", 7), ("default:group::", 0), ("default:other::", 0),
+                        ("default:mask::", recorded_default_mask),
+                    )
+                )
+                if not remaining_default_named and original_default_base:
                     run_setfacl(target, ["-k"])
                     target.default_acl_cleared = True
                     changed = True
@@ -900,10 +947,22 @@ def _set_managed_target_access(
         old_mask = entries.get("mask::", entries.get("group::", 0))
         desired_access = (
             5 if access is AccessLevel.TRAVERSE
-            else 5 if access is AccessLevel.READ_ONLY_DIRECTORY
+            else 4 if access is AccessLevel.READ_ONLY_FILE
+            else 5 if readonly
             else 7 if directory or has_unmanaged_execute(entries, old_mask)
             else 6
         )
+        metadata = os.fstat(target.fd)
+        for user in ACL_USERS:
+            uid = pwd.getpwnam(user).pw_uid
+            if readonly and uid == 0:
+                log(f"Readonly policy cannot constrain privileged user {user}: {target.display_path}")
+                return AclOutcome.FAILED
+            if uid == metadata.st_uid:
+                owner_access = entries.get("user::", 0)
+                if owner_access & desired_access != desired_access or readonly and owner_access & 2:
+                    log(f"Managed owner permissions conflict for {target.display_path}: {user}")
+                    return AclOutcome.FAILED
         new_mask = old_mask | desired_access
         if access is AccessLevel.READ_ONLY_DIRECTORY:
             writers = unmanaged_mask_conflicts(entries, "", old_mask & ~2, old_mask)
@@ -914,10 +973,17 @@ def _set_managed_target_access(
                     + ",".join(writers))
                 return AclOutcome.FAILED
             new_mask &= ~2
+        elif readonly and not unmanaged_mask_conflicts(entries, "", old_mask & ~2, old_mask):
+            new_mask &= ~2
         conflicts = unmanaged_mask_conflicts(entries, "", old_mask, new_mask)
         default_exists = "default:user::" in entries
         old_default_mask = entries.get("default:mask::", entries.get("default:group::", 0))
-        new_default_mask = old_default_mask | 7
+        desired_default = 5 if access is AccessLevel.READ_ONLY_TREE_DIRECTORY else 7
+        new_default_mask = old_default_mask | desired_default
+        if access is AccessLevel.READ_ONLY_TREE_DIRECTORY and not unmanaged_mask_conflicts(
+            entries, "default:", old_default_mask & ~2, old_default_mask,
+        ):
+            new_default_mask &= ~2
         if full_directory and default_exists:
             conflicts += unmanaged_mask_conflicts(entries, "default:", old_default_mask, new_default_mask)
         if conflicts:
@@ -934,11 +1000,11 @@ def _set_managed_target_access(
             for user in ACL_USERS
         )
         default_ok = not full_directory or default_exists and all(
-            entries.get(f"default:user:{user}:", 0) == 7
-            and (entries[f"default:user:{user}:"] & old_default_mask) == 7
+            entries.get(f"default:user:{user}:", 0) == desired_default
+            and (entries[f"default:user:{user}:"] & old_default_mask) == desired_default
             for user in ACL_USERS
         )
-        if access_ok and default_ok and old_mask == new_mask:
+        if access_ok and default_ok and old_mask == new_mask and (not full_directory or old_default_mask == new_default_mask):
             return AclOutcome.CHANGED if changed else AclOutcome.UNCHANGED
         specifications = [f"u:{user}:{permission_text(desired_access)}" for user in ACL_USERS]
         specifications.append(f"m::{permission_text(new_mask)}")
@@ -946,7 +1012,7 @@ def _set_managed_target_access(
             if not default_exists:
                 specifications.extend(("d:u::rwx", "d:g::---", "d:o::---"))
                 target.created_default_acl = True
-            specifications.extend(f"d:u:{user}:rwx" for user in ACL_USERS)
+            specifications.extend(f"d:u:{user}:{permission_text(desired_default)}" for user in ACL_USERS)
             specifications.append(f"d:m::{permission_text(new_default_mask)}")
         run_setfacl(target, ["-n", "-m", ",".join(specifications)])
         log(f"Managed ACL granted: {target.display_path}")
@@ -964,6 +1030,7 @@ def set_managed_access(
     should_have_access: bool | AccessLevel,
     previous_users: Iterable[str] = (),
     created_default_acl: bool = False,
+    previous_access: AccessLevel | None = None,
 ) -> AclOutcome:
     access = (
         should_have_access
@@ -971,11 +1038,11 @@ def set_managed_access(
         else AccessLevel.FULL if should_have_access else AccessLevel.NONE
     )
     if isinstance(target_or_path, ManagedTarget):
-        return _set_managed_target_access(target_or_path, access, previous_users, created_default_acl)
+        return _set_managed_target_access(target_or_path, access, previous_users, created_default_acl, previous_access)
     path = Path(target_or_path)
     try:
         with ManagedRoot(path.parent) as root, root.open_target(path) as target:
-            return _set_managed_target_access(target, access, previous_users, created_default_acl)
+            return _set_managed_target_access(target, access, previous_users, created_default_acl, previous_access)
     except FileNotFoundError:
         return AclOutcome.GONE
     except (OSError, UnsafePathError) as error:
@@ -1013,6 +1080,9 @@ class StateStore:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.parent.chmod(0o700)
         self.connection = sqlite3.connect(path, timeout=30)
+        if self.connection.execute("PRAGMA user_version").fetchone()[0] > STATE_POLICY_VERSION:
+            self.connection.close()
+            raise ValueError("Unsupported state policy version; refusing to discard revoke provenance")
         self.connection.execute("PRAGMA journal_mode=WAL")
         self.connection.execute("PRAGMA synchronous=NORMAL")
         columns = {row[1] for row in self.connection.execute("PRAGMA table_info(paths)")}
@@ -1047,6 +1117,19 @@ class StateStore:
         else:
             self._create_table()
             self.connection.commit()
+        self.connection.execute("BEGIN IMMEDIATE")
+        try:
+            policy_version = self.connection.execute("PRAGMA user_version").fetchone()[0]
+            if policy_version > STATE_POLICY_VERSION:
+                raise ValueError("Unsupported state policy version; refusing to discard revoke provenance")
+            if policy_version < STATE_POLICY_VERSION:
+                self.connection.execute("UPDATE paths SET ctime_ns=-1")
+                self.connection.execute(f"PRAGMA user_version={STATE_POLICY_VERSION}")
+            self.connection.commit()
+        except BaseException:
+            self.connection.rollback()
+            self.connection.close()
+            raise
 
     def _create_table(self) -> None:
         self.connection.execute(
@@ -1210,6 +1293,7 @@ def reconcile_path(
                 desired,
                 previous.users if previous else (),
                 previous.created_default_acl if previous else False,
+                previous.access if previous else None,
             )
             if outcome in {AclOutcome.UNCHANGED, AclOutcome.CHANGED}:
                 state.put(target, desired, managed_root, previous)
@@ -1237,8 +1321,11 @@ def desired_for_matcher(path: Path, root: Path, matcher: IgnoreMatcher, director
             access = matcher.directory_access(relative)
         else:
             access = AccessLevel.FULL if matcher.is_included(relative) else AccessLevel.NONE
-    if directory and access is AccessLevel.FULL and path in READONLY_DIRECTORIES:
-        return AccessLevel.READ_ONLY_DIRECTORY
+    if access is AccessLevel.FULL:
+        if any(path == tree or path.is_relative_to(tree) for tree in READONLY_TREES):
+            return AccessLevel.READ_ONLY_TREE_DIRECTORY if directory else AccessLevel.READ_ONLY_FILE
+        if directory and path in READONLY_DIRECTORIES:
+            return AccessLevel.READ_ONLY_DIRECTORY
     return access
 
 
