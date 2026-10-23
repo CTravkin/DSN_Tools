@@ -601,22 +601,39 @@ class AclReconciliationTests(unittest.TestCase):
                 self.assertEqual(before, get_acl(root))
                 state.close()
 
-    def test_nested_rooted_negation_grants_only_traversal_to_ignored_directory(self) -> None:
+    def test_nested_negation_allows_directory_listing_but_keeps_ignored_file_unreadable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
+            base.chmod(0o755)
             root = base / "folder"
             private = root / "private"
             private.mkdir(parents=True, mode=0o700)
-            state = module.StateStore(base / "state.sqlite3")
-            matcher = module.IgnoreMatcher(expanded_patterns=["!foo/bar", "*"])
+            excluded = private / "excluded.txt"
+            excluded.write_text("excluded fixture", encoding="utf-8")
+            excluded.chmod(0o600)
+            state = module.StateStore(base / "state" / "state.sqlite3")
+            # Match the native REST expansion of "!/foo/bar" and "*".
+            matcher = module.IgnoreMatcher(expanded_patterns=[
+                "!foo/bar", "!foo/bar/**", "*", "**/*", "*/**", "**/*/**",
+            ])
 
             with mock.patch.object(module, "log"):
                 stats = module.reconcile_root(root, matcher, state, force=True)
 
             self.assertEqual(stats.failed, 0)
             entries = get_acl(private)
+            observer = next(user for user in ACL_TEST_USERS if pwd.getpwnam(user).pw_uid != 0)
+            listing = subprocess.run(
+                ("runuser", "-u", observer, "--", "ls", "-A", "--", os.fspath(private)),
+                capture_output=True, text=True,
+            )
+            self.assertEqual(0, listing.returncode, listing.stderr)
+            self.assertIn(excluded.name, listing.stdout)
             for user in ACL_TEST_USERS:
-                self.assertIn(self.acl_entry(user, "--x"), entries)
+                self.assertIn(self.acl_entry(user, "r-x"), entries)
+            readable = subprocess.run(("runuser", "-u", observer, "--", "test", "-r", os.fspath(excluded)))
+            self.assertNotEqual(0, readable.returncode)
+            state.close()
 
     def test_control_file_does_not_receive_managed_access(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

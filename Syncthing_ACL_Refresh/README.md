@@ -34,6 +34,8 @@ CLI options override environment-file values. `--env-file` is intended for direc
 
 `ACL_READONLY_DIRECTORIES` (CLI: `--readonly-directories`) applies only to the exact listed directories, which must exist inside managed folders without symlinks. Managed users receive `r-x`, and the access ACL mask has no write bit. Ignore rules and traversal-only access take precedence over this setting. Descendants follow their normal ignore/access policy; default ACL inheritance remains unchanged. A conflicting unmanaged writer causes an error instead of silently revoking its permissions. The setting is included in reconciliation decisions, so adding or removing it takes effect without `--force`.
 
+Directories needed to reach possible negated matches receive `r-x`: Syncthing's scanner and watcher must list them. This does not grant access to ignored files. Nested negations can require directory listing across the managed tree because Syncthing cannot prune those directories. When upgrading from execute-only traversal, run one full canonical reconciliation with `--force` to refresh cached ACLs; subsequent runs use the normal cache.
+
 Legacy state is migrated with the current `ACL_USERS` value. Revoke recorded ACLs before upgrading if the managed user list also changes.
 
 ## Install and run

@@ -897,7 +897,7 @@ def _set_managed_target_access(
 
         old_mask = entries.get("mask::", entries.get("group::", 0))
         desired_access = (
-            1 if access is AccessLevel.TRAVERSE
+            5 if access is AccessLevel.TRAVERSE
             else 5 if access is AccessLevel.READ_ONLY_DIRECTORY
             else 7 if directory or has_unmanaged_execute(entries, old_mask)
             else 6
